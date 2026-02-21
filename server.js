@@ -251,6 +251,8 @@ Your job is to FIX common errors:
 4. WRONG AUTHOR: If you know the real author of a well-known book and it doesn't match, correct it.
 5. TITLE CLEANUP: Fix obvious OCR-style errors in titles (e.g. "Tnr Hobbit" → "The Hobbit"). But do NOT change titles you don't recognize — they might be correct niche books.
 6. DUPLICATE DETECTION: If two entries are clearly the same book (e.g. "The Hobbit" and "Hobbit, The"), keep only the one with higher confidence.
+7. REPEATED TEXT IN TITLE: If a title contains the same phrase repeated (e.g. "Moon Take a Hike Seattle Moon Take a Hike Seattle Hikes Within Two Hours"), clean it to just the real title ("Moon Take a Hike Seattle").
+8. SUMMARY/REVIEW BOOKS: If a title starts with "Summary of", "Review of", or "Summary and Detail Review of", the real book is what follows. Change the title to just the real book title and set the author to the real author, not the summary publisher.
 
 For each book, preserve the original confidence field. If you made a correction, set "corrected": true on that entry.
 
@@ -328,52 +330,101 @@ app.post("/api/scan", upload.single("photo"), async (req, res) => {
 // ---------------------------------------------------------------------------
 // POST /api/lookup  – look up ISBN + metadata via Open Library
 // ---------------------------------------------------------------------------
+
+/** Check if two author strings are a plausible match */
+function authorsMatch(expected, candidate) {
+  if (!expected || expected === "Unknown" || !candidate) return true; // can’t verify
+  const norm = (s) => s.toLowerCase().replace(/[^a-z]/g, "");
+  const expParts = expected.split(/[,&]/).map(norm).filter(Boolean);
+  const candParts = candidate.split(/[,&]/).map(norm).filter(Boolean);
+  // At least one expected name part should appear in the candidate
+  return expParts.some((ep) => candParts.some((cp) => cp.includes(ep) || ep.includes(cp)));
+}
+
+/** Check if a result looks like a summary/review knockoff */
+function isSummaryKnockoff(resultTitle, queryTitle) {
+  const rt = (resultTitle || "").toLowerCase();
+  const qt = (queryTitle || "").toLowerCase();
+  // If the search query doesn’t start with "summary" but the result does, skip it
+  if (!qt.startsWith("summary") && rt.startsWith("summary")) return true;
+  if (!qt.startsWith("review") && rt.startsWith("review")) return true;
+  if (!qt.startsWith("analysis") && rt.startsWith("analysis of")) return true;
+  return false;
+}
+
+/** Search Open Library with a query string, return top N docs */
+async function searchOpenLibrary(query, limit = 5) {
+  const encoded = encodeURIComponent(query);
+  const url = `https://openlibrary.org/search.json?q=${encoded}&limit=${limit}&fields=title,author_name,isbn,cover_i,first_publish_year,publisher,number_of_pages_median,subject`;
+  const resp = await fetch(url);
+  const data = await resp.json();
+  return data.docs || [];
+}
+
+/** Build an enriched book result from an Open Library doc */
+function docToResult(doc, originalBook) {
+  const isbn13 = (doc.isbn || []).find((i) => i.length === 13) || "";
+  const isbn10 = (doc.isbn || []).find((i) => i.length === 10) || "";
+  const coverId = doc.cover_i;
+  const coverUrl = coverId ? `https://covers.openlibrary.org/b/id/${coverId}-M.jpg` : null;
+  return {
+    title: doc.title || originalBook.title,
+    author: (doc.author_name || []).join(", ") || originalBook.author,
+    isbn13,
+    isbn10,
+    coverUrl,
+    publishYear: doc.first_publish_year || "",
+    publisher: (doc.publisher || [])[0] || "",
+    pages: doc.number_of_pages_median || "",
+    subjects: (doc.subject || []).slice(0, 3).join(", "),
+    matched: true,
+  };
+}
+
+/** Find the best Open Library match for a book, using cascading search */
+async function lookupOneBook(book) {
+  const strategies = [
+    // Strategy 1: title + author
+    () => `${book.title} ${book.author !== "Unknown" ? book.author : ""}`.trim(),
+    // Strategy 2: title only
+    () => book.title,
+    // Strategy 3: title without subtitle (strip after : or —)
+    () => book.title.split(/[:\u2014\-–]/)[0].trim(),
+  ];
+
+  for (const getQuery of strategies) {
+    const query = getQuery();
+    if (!query) continue;
+
+    try {
+      const docs = await searchOpenLibrary(query, 5);
+
+      for (const doc of docs) {
+        // Skip summary/review knockoffs
+        if (isSummaryKnockoff(doc.title, book.title)) continue;
+
+        // Validate author match
+        const candidateAuthor = (doc.author_name || []).join(", ");
+        if (!authorsMatch(book.author, candidateAuthor)) continue;
+
+        return docToResult(doc, book);
+      }
+    } catch {
+      // try next strategy
+    }
+  }
+
+  // No match found with any strategy
+  return { ...book, matched: false };
+}
+
 app.post("/api/lookup", async (req, res) => {
   try {
-    const { books } = req.body; // [{ title, author }, ...]
+    const { books } = req.body;
     if (!Array.isArray(books))
       return res.status(400).json({ error: "books must be an array" });
 
-    const results = await Promise.all(
-      books.map(async (book) => {
-        try {
-          const query = encodeURIComponent(
-            `${book.title} ${book.author !== "Unknown" ? book.author : ""}`
-          );
-          const url = `https://openlibrary.org/search.json?q=${query}&limit=1&fields=title,author_name,isbn,cover_i,first_publish_year,publisher,number_of_pages_median,subject`;
-          const resp = await fetch(url);
-          const data = await resp.json();
-
-          if (data.docs && data.docs.length > 0) {
-            const doc = data.docs[0];
-            const isbn13 =
-              (doc.isbn || []).find((i) => i.length === 13) || "";
-            const isbn10 =
-              (doc.isbn || []).find((i) => i.length === 10) || "";
-            const coverId = doc.cover_i;
-            const coverUrl = coverId
-              ? `https://covers.openlibrary.org/b/id/${coverId}-M.jpg`
-              : null;
-
-            return {
-              title: doc.title || book.title,
-              author: (doc.author_name || []).join(", ") || book.author,
-              isbn13,
-              isbn10,
-              coverUrl,
-              publishYear: doc.first_publish_year || "",
-              publisher: (doc.publisher || [])[0] || "",
-              pages: doc.number_of_pages_median || "",
-              subjects: (doc.subject || []).slice(0, 3).join(", "),
-              matched: true,
-            };
-          }
-          return { ...book, matched: false };
-        } catch {
-          return { ...book, matched: false };
-        }
-      })
-    );
+    const results = await Promise.all(books.map(lookupOneBook));
 
     res.json({ books: results });
   } catch (err) {
