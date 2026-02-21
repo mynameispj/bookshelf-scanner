@@ -12,8 +12,8 @@ const PORT = process.env.PORT || 3000;
 // ---------------------------------------------------------------------------
 // Multer – store uploaded photos temporarily
 // ---------------------------------------------------------------------------
-const uploadDir = path.join(__dirname, "uploads");
-if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
+const uploadDir = process.env.VERCEL ? "/tmp/uploads" : path.join(__dirname, "uploads");
+if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
 
 const storage = multer.diskStorage({
   destination: (_req, _file, cb) => cb(null, uploadDir),
@@ -383,8 +383,12 @@ app.post("/api/lookup", async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// Start server
+// Start server (skip when running on Vercel)
 // ---------------------------------------------------------------------------
-app.listen(PORT, () => {
-  console.log(`\n📚 Bookshelf Scanner running at http://localhost:${PORT}\n`);
-});
+if (!process.env.VERCEL) {
+  app.listen(PORT, () => {
+    console.log(`\n📚 Bookshelf Scanner running at http://localhost:${PORT}\n`);
+  });
+}
+
+module.exports = app;
