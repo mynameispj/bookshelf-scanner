@@ -4,3 +4,4 @@ uploads/*
 !uploads/.gitkeep
 .DS_Store
 .vercel
+.env*.local

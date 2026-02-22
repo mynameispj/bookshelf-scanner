@@ -25,7 +25,7 @@ const upload = multer({ storage, limits: { fileSize: 20 * 1024 * 1024 } });
 // ---------------------------------------------------------------------------
 // OpenAI client
 // ---------------------------------------------------------------------------
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const openai = new OpenAI({ apiKey: (process.env.OPENAI_API_KEY || "").trim() });
 
 // ---------------------------------------------------------------------------
 // Static files
