@@ -179,11 +179,8 @@ Return ONLY a JSON object with these fields, no markdown fences, no commentary:
 
 /** Pass 2 – identify books in a single tile */
 async function identifyBooksInTile(tileDataUri, tileLabel, overview, totalTiles) {
-  // Estimate expected books in this tile
-  const estTotal  = overview?.count || 0;
-  const estInTile = estTotal > 0 ? Math.ceil(estTotal / totalTiles * 1.3) : 0; // 1.3x for overlap
   const anchorHint = overview
-    ? `The full bookshelf contains approximately ${overview.count} books across ${overview.shelves} shelf/shelves. Layout: ${overview.notes}. You are looking at the ${tileLabel} section. You should expect to find roughly ${estInTile} books in this section (possibly more).`
+    ? `The full bookshelf contains approximately ${overview.count} books across ${overview.shelves} shelf/shelves. Layout: ${overview.notes}. You are looking at the ${tileLabel} section.`
     : `You are looking at the ${tileLabel} section of a bookshelf.`;
 
   const completion = await openai.chat.completions.create({
@@ -218,10 +215,12 @@ CRITICAL RULES:
 - You MUST include EVERY book visible, even if it means returning 20+ entries.
 - Do NOT skip books just because the text is hard to read — include them with "low" confidence.
 - Do NOT stop after finding a few books. Carefully scan the ENTIRE image from edge to edge.
-- Do NOT invent titles. If you can only see part of a title, include what you can see.
-- Books that are sideways, stacked flat, or partially behind other books still count.
-- If you recognize a well-known book, use the commonly known correct title and author.
-- After generating your list, re-scan the image once more to see if you missed any books.
+- NEVER HALLUCINATE OR INVENT books. Only report books you can actually SEE in the image.
+- If you can only see a partial title, include what you can see — do NOT guess the rest.
+- If a spine is too blurry to read ANY text, skip it rather than guessing a title.
+- Books that are sideways, stacked flat, or partially behind other books still count — but only if you can see them.
+- If you recognize a well-known book BY ITS VISIBLE TEXT, use the commonly known correct title and author.
+- Do NOT fill in books based on what "might" be on a shelf. Every entry must be grounded in visible text or recognizable cover art.
 
 Return ONLY a JSON array, no markdown fences, no commentary.
 Example: [{"title":"Dune","author":"Frank Herbert","confidence":"high"},{"title":"1984","author":"George Orwell","confidence":"medium"}]
@@ -231,7 +230,7 @@ If no books are visible in this section, return [].`,
         role: "user",
         content: [
           { type: "image_url", image_url: { url: tileDataUri, detail: "high" } },
-          { type: "text", text: `Identify ALL books visible in this section. Be thorough — scan every shelf from left to right and do not stop early. I expect you to find at least ${estInTile || 'several'} books in this section.` },
+          { type: "text", text: "Identify ALL books visible in this section. Be thorough — scan every shelf from left to right. Only include books you can actually see, never guess or invent titles." },
         ],
       },
     ],
@@ -395,11 +394,24 @@ app.post("/api/scan", (req, res, next) => {
 /** Check if two author strings are a plausible match */
 function authorsMatch(expected, candidate) {
   if (!expected || expected === "Unknown" || !candidate) return true; // can’t verify
-  const norm = (s) => s.toLowerCase().replace(/[^a-z]/g, "");
-  const expParts = expected.split(/[,&]/).map(norm).filter(Boolean);
-  const candParts = candidate.split(/[,&]/).map(norm).filter(Boolean);
-  // At least one expected name part should appear in the candidate
-  return expParts.some((ep) => candParts.some((cp) => cp.includes(ep) || ep.includes(cp)));
+  const norm = (s) => s.toLowerCase().replace(/[^a-z\s]/g, "").trim();
+
+  // Split into individual name words for comparison
+  const expWords  = norm(expected).split(/\s+/).filter(w => w.length > 2);
+  const candWords = norm(candidate).split(/\s+/).filter(w => w.length > 2);
+
+  if (expWords.length === 0) return true;
+
+  // Match if the last name (last word) matches, OR if at least half of expected name words appear
+  const expLast  = expWords[expWords.length - 1];
+  const candLast = candWords[candWords.length - 1];
+  if (expLast === candLast) return true;
+
+  // Check if any expected word appears as a substring of any candidate word
+  const matchCount = expWords.filter(ew =>
+    candWords.some(cw => cw.includes(ew) || ew.includes(cw))
+  ).length;
+  return matchCount >= Math.ceil(expWords.length / 2);
 }
 
 /** Check if a result looks like a summary/review knockoff */
@@ -417,9 +429,28 @@ function isSummaryKnockoff(resultTitle, queryTitle) {
 async function searchOpenLibrary(query, limit = 5) {
   const encoded = encodeURIComponent(query);
   const url = `https://openlibrary.org/search.json?q=${encoded}&limit=${limit}&fields=title,author_name,isbn,cover_i,first_publish_year,publisher,number_of_pages_median,subject`;
-  const resp = await fetch(url);
-  const data = await resp.json();
-  return data.docs || [];
+  try {
+    const resp = await fetch(url);
+    if (!resp.ok) return [];
+    const data = await resp.json();
+    return data.docs || [];
+  } catch {
+    return [];
+  }
+}
+
+/** Search Open Library specifically by title field */
+async function searchOpenLibraryByTitle(title, limit = 5) {
+  const encoded = encodeURIComponent(title);
+  const url = `https://openlibrary.org/search.json?title=${encoded}&limit=${limit}&fields=title,author_name,isbn,cover_i,first_publish_year,publisher,number_of_pages_median,subject`;
+  try {
+    const resp = await fetch(url);
+    if (!resp.ok) return [];
+    const data = await resp.json();
+    return data.docs || [];
+  } catch {
+    return [];
+  }
 }
 
 /** Build an enriched book result from an Open Library doc */
@@ -445,28 +476,44 @@ function docToResult(doc, originalBook) {
 /** Find the best Open Library match for a book, using cascading search */
 async function lookupOneBook(book) {
   const strategies = [
-    // Strategy 1: title + author
-    () => `${book.title} ${book.author !== "Unknown" ? book.author : ""}`.trim(),
-    // Strategy 2: title only
-    () => book.title,
-    // Strategy 3: title without subtitle (strip after : or —)
-    () => book.title.split(/[:\u2014\-–]/)[0].trim(),
+    // Strategy 1: title + author (general search)
+    { query: () => `${book.title} ${book.author !== "Unknown" ? book.author : ""}`.trim(), useAuthorFilter: true },
+    // Strategy 2: title only (general search), with author filter
+    { query: () => book.title, useAuthorFilter: true },
+    // Strategy 3: title field search (more precise), with author filter
+    { query: () => book.title, useAuthorFilter: true, titleField: true },
+    // Strategy 4: title without subtitle, general search
+    { query: () => book.title.split(/[:\u2014\-\u2013]/)[0].trim(), useAuthorFilter: true },
+    // Strategy 5: title field search, NO author filter (last resort)
+    { query: () => book.title, useAuthorFilter: false, titleField: true },
+    // Strategy 6: title without subtitle, NO author filter
+    { query: () => book.title.split(/[:\u2014\-\u2013]/)[0].trim(), useAuthorFilter: false },
   ];
 
-  for (const getQuery of strategies) {
-    const query = getQuery();
-    if (!query) continue;
+  for (const strategy of strategies) {
+    const query = strategy.query();
+    if (!query || query.length < 2) continue;
 
     try {
-      const docs = await searchOpenLibrary(query, 5);
+      const docs = strategy.titleField
+        ? await searchOpenLibraryByTitle(query, 5)
+        : await searchOpenLibrary(query, 5);
 
       for (const doc of docs) {
         // Skip summary/review knockoffs
         if (isSummaryKnockoff(doc.title, book.title)) continue;
 
-        // Validate author match
-        const candidateAuthor = (doc.author_name || []).join(", ");
-        if (!authorsMatch(book.author, candidateAuthor)) continue;
+        // Validate author match only if strategy requires it
+        if (strategy.useAuthorFilter) {
+          const candidateAuthor = (doc.author_name || []).join(", ");
+          if (!authorsMatch(book.author, candidateAuthor)) continue;
+        }
+
+        // Basic title sanity check: at least one significant word should overlap
+        const normQ = query.toLowerCase().replace(/[^a-z0-9\s]/g, "").split(/\s+/).filter(w => w.length > 2);
+        const normT = (doc.title || "").toLowerCase().replace(/[^a-z0-9\s]/g, "").split(/\s+/).filter(w => w.length > 2);
+        const titleOverlap = normQ.some(qw => normT.some(tw => tw.includes(qw) || qw.includes(tw)));
+        if (!titleOverlap && normQ.length > 0) continue;
 
         return docToResult(doc, book);
       }
