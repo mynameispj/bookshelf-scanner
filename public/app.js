@@ -56,13 +56,18 @@ btnScan.addEventListener("click", async () => {
   const stages = [
     { delay: 4000,  msg: "Step 2/4: Splitting image into sections for higher accuracy…" },
     { delay: 12000, msg: "Step 3/4: Identifying books in each section…" },
-    { delay: 22000, msg: "Step 4/4: Verifying titles & authors…" },
-    { delay: 35000, msg: "Still working — large shelves take a bit longer…" },
+    { delay: 30000, msg: "Step 4/4: Verifying titles & authors…" },
+    { delay: 50000, msg: "Still working — large shelves take a bit longer…" },
+    { delay: 90000, msg: "Almost there — wrapping up identification…" },
   ];
   const timers = stages.map(s => setTimeout(() => showLoading(s.msg), s.delay));
 
+  // Abort after 4.5 minutes to stay within Vercel's 5-minute limit
+  const controller = new AbortController();
+  const abortTimer = setTimeout(() => controller.abort(), 270000);
+
   try {
-    const res  = await fetch("/api/scan", { method: "POST", body: formData });
+    const res  = await fetch("/api/scan", { method: "POST", body: formData, signal: controller.signal });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error);
 
@@ -70,8 +75,15 @@ btnScan.addEventListener("click", async () => {
     renderReviewList();
     showStep(stepReview);
   } catch (err) {
-    alert("Scan failed: " + err.message);
+    if (err.name === "AbortError") {
+      alert("Scan timed out. Try a smaller or clearer photo with fewer books.");
+    } else if (err instanceof TypeError) {
+      alert("Scan failed: Connection lost. Check your internet connection and try again.");
+    } else {
+      alert("Scan failed: " + (err.message || "Unknown error"));
+    }
   } finally {
+    clearTimeout(abortTimer);
     timers.forEach(clearTimeout);
     hideLoading();
   }
