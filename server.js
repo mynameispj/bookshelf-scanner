@@ -279,7 +279,17 @@ Return ONLY the corrected JSON array, no markdown fences, no commentary. Keep th
 // ---------------------------------------------------------------------------
 // POST /api/scan  – accept an image, return identified books (two-pass + tiling)
 // ---------------------------------------------------------------------------
-app.post("/api/scan", upload.single("photo"), async (req, res) => {
+app.post("/api/scan", (req, res, next) => {
+  upload.single("photo")(req, res, (err) => {
+    if (err) {
+      if (err.code === "LIMIT_FILE_SIZE") {
+        return res.status(413).json({ error: "Image too large. Max 20 MB." });
+      }
+      return res.status(400).json({ error: err.message || "Upload failed" });
+    }
+    next();
+  });
+}, async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "No image uploaded" });
 
@@ -322,7 +332,13 @@ app.post("/api/scan", upload.single("photo"), async (req, res) => {
 
     res.json({ books, overview });
   } catch (err) {
-    console.error("Scan error:", err);
+    console.error("Scan error:", err?.message || err);
+    if (err?.status === 401 || err?.code === "invalid_api_key") {
+      return res.status(500).json({ error: "OpenAI API key is missing or invalid. Check server configuration." });
+    }
+    if (err?.code === "insufficient_quota") {
+      return res.status(500).json({ error: "OpenAI quota exceeded. Please check your billing." });
+    }
     res.status(500).json({ error: err.message || "Failed to process image" });
   }
 });

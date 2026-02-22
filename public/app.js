@@ -31,6 +31,37 @@ function showLoading(msg) { loadingText.textContent = msg; loading.classList.rem
 function hideLoading()    { loading.classList.add("hidden"); }
 function showStep(el)     { [stepCapture, stepReview, stepExport].forEach(s => s.classList.add("hidden")); el.classList.remove("hidden"); }
 
+/**
+ * Compress an image file to stay under Vercel's 4.5 MB body limit.
+ * Resizes to max 2048px on longest side and uses JPEG quality 0.82.
+ * Returns a Blob ready for FormData.
+ */
+function compressImage(file, maxDim = 2048, quality = 0.82) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      let { width, height } = img;
+      if (width > maxDim || height > maxDim) {
+        const ratio = Math.min(maxDim / width, maxDim / height);
+        width  = Math.round(width * ratio);
+        height = Math.round(height * ratio);
+      }
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(img, 0, 0, width, height);
+      canvas.toBlob(
+        (blob) => (blob ? resolve(blob) : reject(new Error("Canvas compression failed"))),
+        "image/jpeg",
+        quality
+      );
+    };
+    img.onerror = () => reject(new Error("Could not load image for compression"));
+    img.src = URL.createObjectURL(file);
+  });
+}
+
 // ── Step 1: Image selection ─────────────────────────────────────────────────
 function handleFileSelect(e) {
   const file = e.target.files[0];
@@ -47,10 +78,22 @@ inputUpload.addEventListener("change", handleFileSelect);
 btnScan.addEventListener("click", async () => {
   if (!selectedFile) return;
 
-  showLoading("Step 1/3: Enhancing image & counting books…");
+  showLoading("Compressing image…");
+
+  let photoBlob;
+  try {
+    photoBlob = await compressImage(selectedFile);
+    console.log(`Compressed: ${(selectedFile.size/1024/1024).toFixed(1)} MB → ${(photoBlob.size/1024/1024).toFixed(1)} MB`);
+  } catch (compErr) {
+    // Fallback: send original file if compression fails
+    console.warn("Image compression failed, using original:", compErr);
+    photoBlob = selectedFile;
+  }
+
+  showLoading("Step 1/4: Enhancing image & counting books…");
 
   const formData = new FormData();
-  formData.append("photo", selectedFile);
+  formData.append("photo", photoBlob, selectedFile.name || "photo.jpg");
 
   // Animate through loading stages to keep user informed
   const stages = [
@@ -67,7 +110,17 @@ btnScan.addEventListener("click", async () => {
   const abortTimer = setTimeout(() => controller.abort(), 270000);
 
   try {
-    const res  = await fetch("/api/scan", { method: "POST", body: formData, signal: controller.signal });
+    const res = await fetch("/api/scan", { method: "POST", body: formData, signal: controller.signal });
+
+    // Handle non-JSON error responses (e.g. Vercel HTML error pages)
+    const contentType = res.headers.get("content-type") || "";
+    if (!contentType.includes("application/json")) {
+      const text = await res.text();
+      if (res.status === 413) throw new Error("Image too large. Please use a smaller photo.");
+      if (res.status >= 500) throw new Error(`Server error (${res.status}). Please try again in a moment.`);
+      throw new Error(`Unexpected response (${res.status}): ${text.slice(0, 120)}`);
+    }
+
     const data = await res.json();
     if (!res.ok) throw new Error(data.error);
 
@@ -78,7 +131,9 @@ btnScan.addEventListener("click", async () => {
     if (err.name === "AbortError") {
       alert("Scan timed out. Try a smaller or clearer photo with fewer books.");
     } else if (err instanceof TypeError) {
-      alert("Scan failed: Connection lost. Check your internet connection and try again.");
+      // TypeError from fetch = network-level failure (connection refused, DNS, CORS, etc.)
+      console.error("Network error during scan:", err);
+      alert("Scan failed: Could not reach the server. Check your internet connection and try again.\n\nIf the problem persists, the image may be too large — try a lower-resolution photo.");
     } else {
       alert("Scan failed: " + (err.message || "Unknown error"));
     }
