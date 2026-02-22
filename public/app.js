@@ -33,10 +33,11 @@ function showStep(el)     { [stepCapture, stepReview, stepExport].forEach(s => s
 
 /**
  * Compress an image file to stay under Vercel's 4.5 MB body limit.
- * Resizes to max 2048px on longest side and uses JPEG quality 0.82.
+ * Resizes to max 3200px on longest side and uses JPEG quality 0.80.
+ * This preserves enough spine-text detail for GPT while keeping size ~2-3 MB.
  * Returns a Blob ready for FormData.
  */
-function compressImage(file, maxDim = 2048, quality = 0.82) {
+function compressImage(file, maxDim = 3200, quality = 0.80) {
   return new Promise((resolve, reject) => {
     const img = new Image();
     img.onload = () => {
@@ -97,11 +98,13 @@ btnScan.addEventListener("click", async () => {
 
   // Animate through loading stages to keep user informed
   const stages = [
-    { delay: 4000,  msg: "Step 2/4: Splitting image into sections for higher accuracy…" },
-    { delay: 12000, msg: "Step 3/4: Identifying books in each section…" },
-    { delay: 30000, msg: "Step 4/4: Verifying titles & authors…" },
-    { delay: 50000, msg: "Still working — large shelves take a bit longer…" },
-    { delay: 90000, msg: "Almost there — wrapping up identification…" },
+    { delay: 4000,  msg: "Step 2/5: Counting books & shelves…" },
+    { delay: 10000, msg: "Step 3/5: Splitting image into sections for accuracy…" },
+    { delay: 18000, msg: "Step 4/5: Identifying every book in each section…" },
+    { delay: 40000, msg: "Step 5/5: Verifying & cleaning titles and authors…" },
+    { delay: 60000, msg: "Still working — scanning all shelves thoroughly…" },
+    { delay: 90000, msg: "Large bookshelf — checking for missed books…" },
+    { delay: 130000, msg: "Almost there — wrapping up identification…" },
   ];
   const timers = stages.map(s => setTimeout(() => showLoading(s.msg), s.delay));
 

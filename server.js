@@ -52,38 +52,77 @@ function bufferToDataUri(buf, mime = "image/jpeg") {
 
 /**
  * Split an image into overlapping tiles.
- * Returns an array of { buffer, label } where label describes position.
- * Uses a 2×2 grid with ~15% overlap on each edge.
+ * Adaptive grid: uses the book-count estimate to decide how many columns/rows.
+ * More books → more tiles → better per-tile accuracy.
+ * Each tile gets ~15% overlap on edges so books at borders aren't missed.
  */
-async function tileImage(buffer) {
+async function tileImage(buffer, overview = null) {
   const meta = await sharp(buffer).metadata();
   const w = meta.width;
   const h = meta.height;
 
-  // For small images (< 1200px wide), don't tile – one pass is fine
+  // For small images (< 1200px on both sides), don't tile
   if (w < 1200 && h < 1200) {
     const enhanced = await enhanceImage(buffer);
     return [{ buffer: enhanced, label: "full image" }];
   }
 
-  const overlapX = Math.round(w * 0.15);
-  const overlapY = Math.round(h * 0.15);
-  const halfW = Math.round(w / 2);
-  const halfH = Math.round(h / 2);
+  // Adaptive grid sizing based on estimated book count and image size
+  const bookCount = overview?.count || 0;
+  const shelves   = overview?.shelves || 1;
 
-  const regions = [
-    { left: 0,               top: 0,               width: halfW + overlapX, height: halfH + overlapY, label: "top-left" },
-    { left: halfW - overlapX, top: 0,               width: w - halfW + overlapX, height: halfH + overlapY, label: "top-right" },
-    { left: 0,               top: halfH - overlapY, width: halfW + overlapX, height: h - halfH + overlapY, label: "bottom-left" },
-    { left: halfW - overlapX, top: halfH - overlapY, width: w - halfW + overlapX, height: h - halfH + overlapY, label: "bottom-right" },
-  ];
+  // Columns: wider images & more books → more columns
+  let cols, rows;
+  if (bookCount >= 40 || w >= 3000) {
+    cols = 4;
+  } else if (bookCount >= 20 || w >= 2000) {
+    cols = 3;
+  } else {
+    cols = 2;
+  }
+
+  // Rows: match shelf count, min 1, but at least 2 for tall images
+  if (shelves >= 4 || h >= 3000) {
+    rows = 4;
+  } else if (shelves >= 2 || h >= 1600) {
+    rows = Math.max(shelves, 2);
+  } else {
+    rows = 1;
+  }
+
+  console.log(`  Adaptive tiling: ${cols}×${rows} grid for ~${bookCount} books, ${shelves} shelves, ${w}×${h}px`);
+
+  const overlapFrac = 0.15;
+  const regions = [];
+
+  for (let row = 0; row < rows; row++) {
+    for (let col = 0; col < cols; col++) {
+      const cellW = Math.round(w / cols);
+      const cellH = Math.round(h / rows);
+      const padL = col > 0        ? Math.round(cellW * overlapFrac) : 0;
+      const padR = col < cols - 1  ? Math.round(cellW * overlapFrac) : 0;
+      const padT = row > 0         ? Math.round(cellH * overlapFrac) : 0;
+      const padB = row < rows - 1  ? Math.round(cellH * overlapFrac) : 0;
+
+      const left   = Math.max(0, col * cellW - padL);
+      const top    = Math.max(0, row * cellH - padT);
+      const right  = Math.min(w, (col + 1) * cellW + padR);
+      const bottom = Math.min(h, (row + 1) * cellH + padB);
+
+      regions.push({
+        left,
+        top,
+        width:  right - left,
+        height: bottom - top,
+        label:  `row${row + 1}-col${col + 1}`,
+      });
+    }
+  }
 
   const tiles = await Promise.all(
     regions.map(async (r) => {
-      const tileW = Math.min(r.width, w - r.left);
-      const tileH = Math.min(r.height, h - r.top);
       const buf = await sharp(buffer)
-        .extract({ left: r.left, top: r.top, width: tileW, height: tileH })
+        .extract({ left: r.left, top: r.top, width: r.width, height: r.height })
         .pipe(sharp().normalize().sharpen({ sigma: 1.2 }))
         .toBuffer();
       return { buffer: buf, label: r.label };
@@ -139,22 +178,25 @@ Return ONLY a JSON object with these fields, no markdown fences, no commentary:
 }
 
 /** Pass 2 – identify books in a single tile */
-async function identifyBooksInTile(tileDataUri, tileLabel, overview) {
+async function identifyBooksInTile(tileDataUri, tileLabel, overview, totalTiles) {
+  // Estimate expected books in this tile
+  const estTotal  = overview?.count || 0;
+  const estInTile = estTotal > 0 ? Math.ceil(estTotal / totalTiles * 1.3) : 0; // 1.3x for overlap
   const anchorHint = overview
-    ? `The full bookshelf contains approximately ${overview.count} books across ${overview.shelves} shelf/shelves. Layout: ${overview.notes}. You are looking at the ${tileLabel} section.`
+    ? `The full bookshelf contains approximately ${overview.count} books across ${overview.shelves} shelf/shelves. Layout: ${overview.notes}. You are looking at the ${tileLabel} section. You should expect to find roughly ${estInTile} books in this section (possibly more).`
     : `You are looking at the ${tileLabel} section of a bookshelf.`;
 
   const completion = await openai.chat.completions.create({
     model: "gpt-4o",
-    max_tokens: 4096,
+    max_tokens: 8192,
     messages: [
       {
         role: "system",
         content: `You are a book-identification expert. You will receive a cropped section of a bookshelf photo.
 ${anchorHint}
 
-Identify EVERY book whose spine or cover is at least partially visible in THIS section.
-Scan methodically: shelf by shelf, left to right.
+Your task: identify EVERY SINGLE book whose spine or cover is at least partially visible in THIS section.
+Scan methodically: shelf by shelf, left to right, top to bottom. Do NOT stop early.
 
 For each book return:
   - title       (string – the book's title ONLY, no author names)
@@ -172,11 +214,14 @@ TITLE vs AUTHOR — how to tell them apart on a spine:
 - If you recognize the book (e.g. "It" by Stephen King), use your world knowledge to confirm the correct title/author split.
 - If the cover shows the author name prominently (common for famous authors), do NOT put it in the title field.
 
-IMPORTANT:
+CRITICAL RULES:
+- You MUST include EVERY book visible, even if it means returning 20+ entries.
 - Do NOT skip books just because the text is hard to read — include them with "low" confidence.
+- Do NOT stop after finding a few books. Carefully scan the ENTIRE image from edge to edge.
 - Do NOT invent titles. If you can only see part of a title, include what you can see.
 - Books that are sideways, stacked flat, or partially behind other books still count.
 - If you recognize a well-known book, use the commonly known correct title and author.
+- After generating your list, re-scan the image once more to see if you missed any books.
 
 Return ONLY a JSON array, no markdown fences, no commentary.
 Example: [{"title":"Dune","author":"Frank Herbert","confidence":"high"},{"title":"1984","author":"George Orwell","confidence":"medium"}]
@@ -186,7 +231,7 @@ If no books are visible in this section, return [].`,
         role: "user",
         content: [
           { type: "image_url", image_url: { url: tileDataUri, detail: "high" } },
-          { type: "text", text: "Identify all books visible in this section of the bookshelf." },
+          { type: "text", text: `Identify ALL books visible in this section. Be thorough — scan every shelf from left to right and do not stop early. I expect you to find at least ${estInTile || 'several'} books in this section.` },
         ],
       },
     ],
@@ -306,15 +351,15 @@ app.post("/api/scan", (req, res, next) => {
       console.warn("  Pass 1 (count) failed, continuing without anchor:", e.message);
     }
 
-    // ── Tile the image ────────────────────────────────────────
-    const tiles = await tileImage(imageBuffer);
+    // ── Tile the image (adaptive grid based on book count) ───
+    const tiles = await tileImage(imageBuffer, overview);
     console.log(`  Tiling → ${tiles.length} tile(s)`);
 
     // ── Pass 2: Identify books in each tile (parallel) ────────
     const tileResults = await Promise.all(
       tiles.map((tile) => {
         const uri = bufferToDataUri(tile.buffer, "image/jpeg");
-        return identifyBooksInTile(uri, tile.label, overview);
+        return identifyBooksInTile(uri, tile.label, overview, tiles.length);
       })
     );
 
