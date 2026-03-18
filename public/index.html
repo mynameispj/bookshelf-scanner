@@ -13,6 +13,15 @@
   </header>
 
   <main>
+    <!-- ── Step progress bar ────────────────────────────────────── -->
+    <div class="step-progress">
+      <div class="step-pip active" data-step="1"><span>1</span></div>
+      <div class="step-connector"></div>
+      <div class="step-pip" data-step="2"><span>2</span></div>
+      <div class="step-connector"></div>
+      <div class="step-pip" data-step="3"><span>3</span></div>
+    </div>
+
     <!-- ── Step 1: Capture ──────────────────────────────────────── -->
     <section id="step-capture" class="step active">
       <h2><span class="badge">1</span> Take or Upload a Photo</h2>
@@ -26,18 +35,21 @@
         </ul>
       </div>
       <div class="capture-area">
-        <label class="btn btn-primary" id="btn-camera">
-          📷 Take Photo
-          <input type="file" accept="image/*" capture="environment" id="input-camera" hidden />
-        </label>
-        <label class="btn btn-secondary">
-          🖼️ Upload Image
-          <input type="file" accept="image/*" id="input-upload" hidden />
-        </label>
+        <div class="btn-row">
+          <label class="btn btn-primary" id="btn-camera">
+            📷 Take Photo
+            <input type="file" accept="image/*" capture="environment" id="input-camera" hidden />
+          </label>
+          <span style="align-self:center; color:#9ca3af; font-size:0.85rem;">or</span>
+          <label class="btn btn-outline">
+            🖼️ Upload Image
+            <input type="file" accept="image/*" id="input-upload" hidden />
+          </label>
+        </div>
       </div>
       <div id="preview-container" class="hidden">
         <img id="preview-img" alt="Preview" />
-        <button class="btn btn-primary" id="btn-scan">🔍 Scan for Books</button>
+        <button class="btn btn-primary" id="btn-scan" disabled>🔍 Scan for Books</button>
       </div>
     </section>
 
@@ -45,7 +57,11 @@
     <section id="step-review" class="step hidden">
       <h2><span class="badge">2</span> Review Identified Books</h2>
       <p class="hint" id="review-hint"></p>
-      <div id="book-list"></div>
+      <div id="book-list">
+        <div id="book-list-empty" class="empty-state hidden">
+          <p>No books detected yet. Try scanning a clearer photo, or add books manually below.</p>
+        </div>
+      </div>
       <div class="actions">
         <button class="btn btn-secondary" id="btn-add-manual">＋ Add Book Manually</button>
         <button class="btn btn-primary" id="btn-lookup">🔎 Look Up ISBNs &amp; Metadata</button>
@@ -56,6 +72,7 @@
     <section id="step-export" class="step hidden">
       <h2><span class="badge">3</span> Export to Libib</h2>
       <p class="hint">Review the enriched data, then download the CSV to import into Libib.</p>
+      <p id="export-summary" class="export-summary"></p>
       <div id="enriched-list"></div>
       <div class="actions">
         <button class="btn btn-primary" id="btn-download-csv">⬇️ Download Libib CSV</button>
