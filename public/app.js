@@ -30,6 +30,13 @@ const loadingText = $("#loading-text");
 function showLoading(msg) { loadingText.textContent = msg; loading.classList.remove("hidden"); }
 function hideLoading()    { loading.classList.add("hidden"); }
 function showStep(el)     { [stepCapture, stepReview, stepExport].forEach(s => s.classList.add("hidden")); el.classList.remove("hidden"); }
+function setStep(n) {
+  document.querySelectorAll('.step-pip').forEach((pip, i) => {
+    pip.classList.remove('active', 'done');
+    if (i + 1 === n) pip.classList.add('active');
+    if (i + 1 < n) pip.classList.add('done');
+  });
+}
 
 /**
  * Compress an image file to stay under Vercel's 4.5 MB body limit.
@@ -70,6 +77,7 @@ function handleFileSelect(e) {
   selectedFile = file;
   previewImg.src = URL.createObjectURL(file);
   previewContainer.classList.remove("hidden");
+  btnScan.disabled = false;
 }
 
 inputCamera.addEventListener("change", handleFileSelect);
@@ -129,6 +137,7 @@ btnScan.addEventListener("click", async () => {
 
     identifiedBooks = data.books;
     renderReviewList();
+    setStep(2);
     showStep(stepReview);
   } catch (err) {
     if (err.name === "AbortError") {
@@ -156,6 +165,11 @@ function renderReviewList() {
   else hint += " Edit titles/authors or remove mistakes.";
   reviewHint.textContent = hint;
   bookList.innerHTML = "";
+
+  if (identifiedBooks.length === 0) {
+    bookList.innerHTML = '<div class="empty-state"><p>No books detected yet. Try scanning a clearer photo, or add books manually below.</p></div>';
+    return;
+  }
 
   identifiedBooks.forEach((book, i) => {
     const conf = book.confidence || "high";
@@ -220,6 +234,9 @@ btnLookup.addEventListener("click", async () => {
 
     enrichedBooks = data.books;
     renderEnrichedList();
+    const n = enrichedBooks.length;
+    $("#export-summary").textContent = `Ready to export ${n} book${n !== 1 ? 's' : ''} to Libib.`;
+    setStep(3);
     showStep(stepExport);
   } catch (err) {
     alert("Lookup failed: " + err.message);
@@ -302,7 +319,9 @@ btnStartOver.addEventListener("click", () => {
   enrichedBooks = [];
   selectedFile = null;
   previewContainer.classList.add("hidden");
+  btnScan.disabled = true;
   inputCamera.value = "";
   inputUpload.value = "";
+  setStep(1);
   showStep(stepCapture);
 });
