@@ -75,24 +75,24 @@ async function tileImage(buffer, overview = null) {
   let cols, rows;
   if (bookCount >= 40 || w >= 3000) {
     cols = 4;
-  } else if (bookCount >= 20 || w >= 2000) {
+  } else if (bookCount >= 15 || w >= 2000) {
     cols = 3;
   } else {
     cols = 2;
   }
 
-  // Rows: match shelf count, min 1, but at least 2 for tall images
+  // Rows: match shelf count, but enforce minimum 2 for any non-trivial image
   if (shelves >= 4 || h >= 3000) {
     rows = 4;
-  } else if (shelves >= 2 || h >= 1600) {
-    rows = Math.max(shelves, 2);
+  } else if (shelves >= 3 || h >= 2400) {
+    rows = 3;
   } else {
-    rows = 1;
+    rows = Math.max(shelves, 2); // minimum 2 rows always
   }
 
   console.log(`  Adaptive tiling: ${cols}×${rows} grid for ~${bookCount} books, ${shelves} shelves, ${w}×${h}px`);
 
-  const overlapFrac = 0.15;
+  const overlapFrac = 0.25; // 25% overlap to catch books at tile boundaries
   const regions = [];
 
   for (let row = 0; row < rows; row++) {
@@ -145,7 +145,7 @@ function parseGptJson(raw) {
   return JSON.parse(text);
 }
 
-/** Pass 1 – quick count & overview using low-detail (cheap) */
+/** Pass 1 – quick count & overview using auto detail for accuracy */
 async function countBooks(dataUri) {
   const completion = await openai.chat.completions.create({
     model: "gpt-4o",
@@ -157,6 +157,8 @@ async function countBooks(dataUri) {
 Count every distinct book whose spine or cover is at least partially visible.
 Scan systematically: shelf by shelf, left to right, top to bottom.
 Include books that are sideways, stacked flat, partially hidden, or only partly in frame.
+People commonly UNDERCOUNT books in photos — count carefully and err on the side of counting MORE.
+Look for thin spines, small paperbacks, and books partially hidden behind others.
 
 Return ONLY a JSON object with these fields, no markdown fences, no commentary:
 {
@@ -168,8 +170,8 @@ Return ONLY a JSON object with these fields, no markdown fences, no commentary:
       {
         role: "user",
         content: [
-          { type: "image_url", image_url: { url: dataUri, detail: "low" } },
-          { type: "text", text: "How many books are visible in this image?" },
+          { type: "image_url", image_url: { url: dataUri, detail: "auto" } },
+          { type: "text", text: "How many books are visible in this image? Count carefully — look for thin spines and partially hidden books. Err on the side of counting more rather than fewer." },
         ],
       },
     ],
@@ -250,25 +252,58 @@ function normalizeTitle(t) {
     .trim();
 }
 
+/** Check if two normalized titles are fuzzy-matches (one contains the other, or high word overlap) */
+function titlesAreSimilar(normA, normB) {
+  if (!normA || !normB) return false;
+  if (normA === normB) return true;
+
+  // One is a substring of the other (handles "Best Hikes with Kids" vs "Best Hikes with Kids Western Washington")
+  if (normA.includes(normB) || normB.includes(normA)) return true;
+
+  // Word-level overlap: if 60%+ of the shorter title's words appear in the longer one
+  const wordsA = normA.match(/[a-z0-9]+/g) || [];
+  const wordsB = normB.match(/[a-z0-9]+/g) || [];
+  if (wordsA.length < 2 || wordsB.length < 2) return false;
+
+  const [shorter, longer] = wordsA.length <= wordsB.length ? [wordsA, wordsB] : [wordsB, wordsA];
+  const matchCount = shorter.filter(w => w.length > 2 && longer.includes(w)).length;
+  const significantWords = shorter.filter(w => w.length > 2).length;
+  return significantWords > 0 && matchCount / significantWords >= 0.6;
+}
+
 /**
  * Merge book arrays from multiple tiles. Keep the highest-confidence copy
- * when duplicates are found (same normalized title).
+ * when duplicates are found (same or similar normalized title).
  */
 function deduplicateBooks(allBooks) {
   const confRank = { high: 3, medium: 2, low: 1 };
-  const map = new Map(); // normalizedTitle → best book
+  const results = []; // array of { normTitle, book }
 
   for (const book of allBooks) {
-    const key = normalizeTitle(book.title);
-    if (!key) continue;
+    const normTitle = normalizeTitle(book.title);
+    if (!normTitle) continue;
 
-    const existing = map.get(key);
-    if (!existing || (confRank[book.confidence] || 0) > (confRank[existing.confidence] || 0)) {
-      map.set(key, book);
+    // Find existing entry that's similar
+    let matched = false;
+    for (let i = 0; i < results.length; i++) {
+      if (titlesAreSimilar(normTitle, results[i].normTitle)) {
+        // Keep whichever has higher confidence; if tied, keep the one with the longer (more complete) title
+        const existingRank = confRank[results[i].book.confidence] || 0;
+        const newRank = confRank[book.confidence] || 0;
+        if (newRank > existingRank || (newRank === existingRank && book.title.length > results[i].book.title.length)) {
+          results[i] = { normTitle, book };
+        }
+        matched = true;
+        break;
+      }
+    }
+
+    if (!matched) {
+      results.push({ normTitle, book });
     }
   }
 
-  return [...map.values()];
+  return results.map(r => r.book);
 }
 
 // ---------------------------------------------------------------------------
@@ -289,14 +324,16 @@ async function verifyAndCleanBooks(books) {
 
 Your job is to FIX common errors:
 
-1. AUTHOR IN TITLE: If the title field contains the author's name (e.g. title="Stephen King It"), split it so title="It" and author="Stephen King".
-2. TITLE IN AUTHOR: If the author field contains a title or subtitle, move it to the title field.
-3. UNKNOWN AUTHOR: If the author is "Unknown" but you recognize the book from its title, fill in the correct author.
-4. WRONG AUTHOR: If you know the real author of a well-known book and it doesn't match, correct it.
-5. TITLE CLEANUP: Fix obvious OCR-style errors in titles (e.g. "Tnr Hobbit" → "The Hobbit"). But do NOT change titles you don't recognize — they might be correct niche books.
-6. DUPLICATE DETECTION: If two entries are clearly the same book (e.g. "The Hobbit" and "Hobbit, The"), keep only the one with higher confidence.
-7. REPEATED TEXT IN TITLE: If a title contains the same phrase repeated (e.g. "Moon Take a Hike Seattle Moon Take a Hike Seattle Hikes Within Two Hours"), clean it to just the real title ("Moon Take a Hike Seattle").
-8. SUMMARY/REVIEW BOOKS: If a title starts with "Summary of", "Review of", or "Summary and Detail Review of", the real book is what follows. Change the title to just the real book title and set the author to the real author, not the summary publisher.
+1. AUTHOR NAME AS TITLE: This is the #1 most common error. Famous authors (Philip Roth, Stephen King, James Patterson, etc.) often have their name printed VERY LARGE on the spine. The OCR may mistake the author name for the book title. If the "title" field is just an author's name (e.g. title="PHILIP ROTH", title="STEPHEN KING", title="Philip"), this is WRONG — the real title was missed. Try to identify the actual book title from context (other entries, the author name), or REMOVE the entry if you cannot determine the real title.
+2. AUTHOR IN TITLE: If the title field contains the author's name combined with the book title (e.g. title="Stephen King It"), split it so title="It" and author="Stephen King".
+3. TITLE IN AUTHOR: If the author field contains a title or subtitle, move it to the title field.
+4. UNKNOWN AUTHOR: If the author is "Unknown" but you recognize the book from its title, fill in the correct author.
+5. WRONG AUTHOR: If you know the real author of a well-known book and it doesn't match, correct it.
+6. TITLE CLEANUP: Fix obvious OCR-style errors in titles (e.g. "Tnr Hobbit" → "The Hobbit"). But do NOT change titles you don't recognize — they might be correct niche books.
+7. DUPLICATE DETECTION: If two entries are clearly the same book (e.g. "The Hobbit" and "Hobbit, The"), keep only the one with higher confidence. Also merge entries that are clearly variations (e.g. one with a subtitle and one without).
+8. REPEATED TEXT IN TITLE: If a title contains the same phrase repeated, clean it to just the real title.
+9. SUMMARY/REVIEW BOOKS: If a title starts with "Summary of", "Review of", etc., change it to the real book title.
+10. GARBAGE ENTRIES: Remove entries where the title is just a single word that is clearly an author's first or last name, or entries that don't represent actual books.
 
 For each book, preserve the original confidence field. If you made a correction, set "corrected": true on that entry.
 
@@ -354,16 +391,19 @@ app.post("/api/scan", (req, res, next) => {
     const tiles = await tileImage(imageBuffer, overview);
     console.log(`  Tiling → ${tiles.length} tile(s)`);
 
-    // ── Pass 2: Identify books in each tile (parallel) ────────
-    const tileResults = await Promise.all(
-      tiles.map((tile) => {
-        const uri = bufferToDataUri(tile.buffer, "image/jpeg");
-        return identifyBooksInTile(uri, tile.label, overview, tiles.length);
-      })
-    );
+    // ── Pass 2: Identify books in each tile + full image (parallel) ──
+    const tilePromises = tiles.map((tile) => {
+      const uri = bufferToDataUri(tile.buffer, "image/jpeg");
+      return identifyBooksInTile(uri, tile.label, overview, tiles.length);
+    });
 
-    // Flatten and deduplicate
-    const allBooks = tileResults.flat();
+    // Also run identification on the full image for a holistic view
+    const fullImagePromise = identifyBooksInTile(fullUri, "full image (overview)", overview, tiles.length);
+
+    const [fullImageResult, ...tileResults] = await Promise.all([fullImagePromise, ...tilePromises]);
+
+    // Flatten tile results + full image results and deduplicate
+    const allBooks = [...fullImageResult, ...tileResults.flat()];
     const dedupedBooks = deduplicateBooks(allBooks);
 
     console.log(`  Pass 2 → ${allBooks.length} raw IDs, ${dedupedBooks.length} after dedup`);
