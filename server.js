@@ -207,6 +207,12 @@ For each book return:
     • "medium" = partially readable, you're fairly sure
     • "low"    = guessing from color/shape/partial letters
 
+TEXT ORIENTATION — books appear in many orientations:
+- Spines run vertically (text reads bottom-to-top or top-to-bottom).
+- Books stacked flat may show a cover or back cover face-up or face-down — read the cover text.
+- Text on flat-stacked books may be UPSIDE DOWN relative to the rest of the image — mentally rotate and read it anyway.
+- Do NOT skip a book just because its text is rotated or upside down.
+
 TITLE vs AUTHOR — how to tell them apart on a spine:
 - On most spines the author name and title are in SEPARATE text blocks with different font sizes.
 - The author name is usually SMALLER text and appears at the TOP or BOTTOM of the spine.
@@ -219,10 +225,10 @@ CRITICAL RULES — READ CAREFULLY:
 - Only report a book if you can actually see its spine or cover in THIS image. Never invent or guess books.
 - Include every book you can genuinely see, even if it means returning 20+ entries.
 - Do NOT skip books just because the text is hard to read — include them with "low" confidence.
-- Scan the ENTIRE image from edge to edge before finishing.
+- Scan the ENTIRE image from edge to edge before finishing. Check every stack, every upright spine, every flat cover.
 - If you can only see a partial title, include what you can see — do NOT complete it from memory.
 - If a spine is too blurry to read ANY text, skip it rather than guessing a title.
-- Books sideways, stacked flat, or partially hidden count — but only if you can see them.
+- Books sideways, stacked flat, upside down, or partially hidden count — but only if you can see them.
 - If you recognise a well-known book BY ITS VISIBLE TEXT, use the correct known title and author.
 - NEVER fill in books based on what "might" be on a shelf or what books are commonly owned. Every entry must be grounded in text or cover art you can actually see in this image.
 - When in doubt about whether something is a real book spine vs background, omit it.
@@ -235,7 +241,7 @@ If no books are visible in this section, return [].`,
         role: "user",
         content: [
           { type: "image_url", image_url: { url: tileDataUri, detail: "high" } },
-          { type: "text", text: "Identify every book whose spine or cover you can actually see in this section. Scan every shelf left to right. Only include books grounded in text or cover art visible in this image — never guess or invent titles." },
+          { type: "text", text: "Identify every book whose spine or cover you can actually see in this section. Scan every shelf left to right, and check all stacked books — including flat-stacked books whose covers or text may be upside down or rotated. Only include books grounded in text or cover art visible in this image — never guess or invent titles." },
         ],
       },
     ],
