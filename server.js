@@ -181,8 +181,10 @@ Return ONLY a JSON object with these fields, no markdown fences, no commentary:
 
 /** Pass 2 – identify books in a single tile */
 async function identifyBooksInTile(tileDataUri, tileLabel, overview, totalTiles) {
+  // Omit the book count from the anchor hint — telling GPT "there are ~N books"
+  // can pressure it to hallucinate entries to reach the expected number.
   const anchorHint = overview
-    ? `The full bookshelf contains approximately ${overview.count} books across ${overview.shelves} shelf/shelves. Layout: ${overview.notes}. You are looking at the ${tileLabel} section.`
+    ? `The image shows ${overview.shelves} shelf/shelves. Layout: ${overview.notes}. You are looking at the ${tileLabel} section.`
     : `You are looking at the ${tileLabel} section of a bookshelf.`;
 
   const completion = await openai.chat.completions.create({
@@ -213,16 +215,17 @@ TITLE vs AUTHOR — how to tell them apart on a spine:
 - If you recognize the book (e.g. "It" by Stephen King), use your world knowledge to confirm the correct title/author split.
 - If the cover shows the author name prominently (common for famous authors), do NOT put it in the title field.
 
-CRITICAL RULES:
-- You MUST include EVERY book visible, even if it means returning 20+ entries.
+CRITICAL RULES — READ CAREFULLY:
+- Only report a book if you can actually see its spine or cover in THIS image. Never invent or guess books.
+- Include every book you can genuinely see, even if it means returning 20+ entries.
 - Do NOT skip books just because the text is hard to read — include them with "low" confidence.
-- Do NOT stop after finding a few books. Carefully scan the ENTIRE image from edge to edge.
-- NEVER HALLUCINATE OR INVENT books. Only report books you can actually SEE in the image.
-- If you can only see a partial title, include what you can see — do NOT guess the rest.
+- Scan the ENTIRE image from edge to edge before finishing.
+- If you can only see a partial title, include what you can see — do NOT complete it from memory.
 - If a spine is too blurry to read ANY text, skip it rather than guessing a title.
-- Books that are sideways, stacked flat, or partially behind other books still count — but only if you can see them.
-- If you recognize a well-known book BY ITS VISIBLE TEXT, use the commonly known correct title and author.
-- Do NOT fill in books based on what "might" be on a shelf. Every entry must be grounded in visible text or recognizable cover art.
+- Books sideways, stacked flat, or partially hidden count — but only if you can see them.
+- If you recognise a well-known book BY ITS VISIBLE TEXT, use the correct known title and author.
+- NEVER fill in books based on what "might" be on a shelf or what books are commonly owned. Every entry must be grounded in text or cover art you can actually see in this image.
+- When in doubt about whether something is a real book spine vs background, omit it.
 
 Return ONLY a JSON array, no markdown fences, no commentary.
 Example: [{"title":"Dune","author":"Frank Herbert","confidence":"high"},{"title":"1984","author":"George Orwell","confidence":"medium"}]
@@ -232,7 +235,7 @@ If no books are visible in this section, return [].`,
         role: "user",
         content: [
           { type: "image_url", image_url: { url: tileDataUri, detail: "high" } },
-          { type: "text", text: "Identify ALL books visible in this section. Be thorough — scan every shelf from left to right. Only include books you can actually see, never guess or invent titles." },
+          { type: "text", text: "Identify every book whose spine or cover you can actually see in this section. Scan every shelf left to right. Only include books grounded in text or cover art visible in this image — never guess or invent titles." },
         ],
       },
     ],
@@ -358,6 +361,75 @@ Return ONLY the corrected JSON array, no markdown fences, no commentary. Keep th
 }
 
 // ---------------------------------------------------------------------------
+// Pass 4 – visual verification: re-show the original image + book list to GPT
+// and ask it to confirm which books are actually visible on the shelf.
+// This is the primary defence against hallucinated books.
+// ---------------------------------------------------------------------------
+async function visuallyVerifyBooks(books, imageDataUri) {
+  if (books.length === 0) return books;
+
+  const bookListText = books
+    .map((b, i) => `${i + 1}. "${b.title}" by ${b.author}`)
+    .join("\n");
+
+  const completion = await openai.chat.completions.create({
+    model: "gpt-4o",
+    max_tokens: 4096,
+    messages: [
+      {
+        role: "system",
+        content: `You are a book verification assistant. You will receive a bookshelf photo and a list of books that were claimed to be identified from it.
+
+Your job: look at the actual photo and decide, for EACH book in the list, whether you can genuinely see that book's spine or cover in the image.
+
+Mark a book "visible": true ONLY if:
+- You can find its spine or cover somewhere in the image.
+- At least part of the title text is actually readable on a spine you can see.
+- Or you can confidently identify it from clearly recognisable cover art.
+
+Mark a book "visible": false if:
+- You cannot find any spine in the image that plausibly matches this title.
+- The title seems to have been invented — no visible spine corresponds to it.
+- The entry looks like a garbled mis-reading of a different book that IS on the shelf.
+
+Do NOT over-reject: if you are genuinely unsure, lean toward visible=true.
+But hallucinated books — those with no matching spine anywhere — must be marked visible=false.
+
+Return ONLY a JSON array in this exact format, no markdown fences, no commentary:
+[{"title":"...","author":"...","confidence":"...","corrected":true|false,"visible":true}]`,
+      },
+      {
+        role: "user",
+        content: [
+          { type: "image_url", image_url: { url: imageDataUri, detail: "high" } },
+          {
+            type: "text",
+            text: `Here is the list of books the scanner identified. Please look at the photo and set "visible": true only for books whose spine or cover you can actually see:\n\n${bookListText}`,
+          },
+        ],
+      },
+    ],
+  });
+
+  try {
+    const verified = parseGptJson(completion.choices[0].message.content);
+    const removed = verified.filter((b) => b.visible === false).map((b) => b.title);
+    if (removed.length > 0) {
+      console.log(`  Pass 4 (visual verify) → removed ${removed.length} unconfirmed book(s): ${removed.join(", ")}`);
+    } else {
+      console.log(`  Pass 4 (visual verify) → all books confirmed`);
+    }
+    // Strip the helper field and return only confirmed books
+    return verified
+      .filter((b) => b.visible !== false)
+      .map(({ visible: _v, ...rest }) => rest);
+  } catch (e) {
+    console.warn("  Pass 4 (visual verify) parse failed, keeping unverified results:", e.message);
+    return books;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // POST /api/scan  – accept an image, return identified books (two-pass + tiling)
 // ---------------------------------------------------------------------------
 app.post("/api/scan", (req, res, next) => {
@@ -409,7 +481,12 @@ app.post("/api/scan", (req, res, next) => {
     console.log(`  Pass 2 → ${allBooks.length} raw IDs, ${dedupedBooks.length} after dedup`);
 
     // ── Pass 3: Verify & clean title/author data ──────────────
-    const books = await verifyAndCleanBooks(dedupedBooks);
+    const pass3Books = await verifyAndCleanBooks(dedupedBooks);
+
+    // ── Pass 4: Visual confirmation – remove hallucinated books ──
+    const books = await visuallyVerifyBooks(pass3Books, fullUri);
+
+    console.log(`  Final → ${books.length} book(s) after all passes`);
 
     // Clean up uploaded file
     fs.unlink(req.file.path, () => {});
