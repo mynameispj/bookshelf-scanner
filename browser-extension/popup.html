@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Bookshelf Scanner</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <header>
+    <span class="logo">📚</span>
+    <div class="header-text">
+      <h1>Bookshelf Scanner</h1>
+      <div id="server-status" class="status-badge checking">checking…</div>
+    </div>
+    <a href="#" id="btn-settings" title="Settings" class="settings-link">⚙️</a>
+  </header>
+
+  <!-- Step 1: Capture -->
+  <section id="step-capture" class="step">
+    <div class="btn-row">
+      <label class="btn btn-primary">
+        📷 Take Photo
+        <input type="file" accept="image/*" capture="environment" id="input-camera" hidden />
+      </label>
+      <label class="btn btn-outline">
+        🖼️ Upload
+        <input type="file" accept="image/*" id="input-upload" hidden />
+      </label>
+    </div>
+    <div id="preview-container" class="hidden">
+      <img id="preview-img" alt="Preview" />
+      <button class="btn btn-primary full-width" id="btn-scan" disabled>🔍 Scan for Books</button>
+    </div>
+  </section>
+
+  <!-- Step 2: Review -->
+  <section id="step-review" class="step hidden">
+    <div class="step-header">
+      <span id="review-hint" class="hint"></span>
+      <button class="btn btn-sm btn-secondary" id="btn-back">← Back</button>
+    </div>
+    <div id="book-list"></div>
+    <div class="actions">
+      <button class="btn btn-sm btn-secondary" id="btn-add-manual">＋ Add</button>
+      <button class="btn btn-sm btn-primary" id="btn-lookup">🔎 Look Up ISBNs</button>
+    </div>
+  </section>
+
+  <!-- Step 3: Export -->
+  <section id="step-export" class="step hidden">
+    <div class="step-header">
+      <span id="export-summary" class="hint"></span>
+      <button class="btn btn-sm btn-secondary" id="btn-back-2">← Back</button>
+    </div>
+    <div id="enriched-list"></div>
+    <div class="actions">
+      <button class="btn btn-primary full-width" id="btn-download-csv">⬇️ Download CSV</button>
+    </div>
+    <div class="actions">
+      <button class="btn btn-sm btn-secondary full-width" id="btn-open-app">↗ Open full app</button>
+    </div>
+  </section>
+
+  <!-- Loading overlay -->
+  <div id="loading" class="hidden">
+    <div class="spinner"></div>
+    <p id="loading-text">Analyzing…</p>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

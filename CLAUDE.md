@@ -21,6 +21,12 @@ public/
   index.html        # Single-page app shell (3-step wizard UI)
   app.js            # Frontend state management, event handlers, API calls
   style.css         # Mobile-responsive styles (green theme)
+browser-extension/  # Chrome Manifest V3 dev plugin (see README for load instructions)
+  manifest.json     # Extension config (popup, options page, storage permission)
+  popup.html/js/css # Extension popup — mirrors the capture→review→export flow
+  options.html/js   # Settings page — configurable server URL (default: localhost:3000)
+  generate-icons.js # One-time script to generate PNG icons via Sharp
+  icons/            # Generated PNG icons (16, 48, 128 px)
 uploads/            # Temporary image storage (gitignored, uses /tmp on Vercel)
 .env.example        # Environment variable template
 vercel.json         # Vercel deployment config (300s timeout)

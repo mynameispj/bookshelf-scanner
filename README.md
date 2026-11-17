@@ -61,6 +61,48 @@ Open **http://localhost:3000** in your browser (works great on mobile too!).
 | Frontend  | Vanilla HTML/CSS/JS |
 | Export    | Libib-compatible CSV |
 
+## Browser Extension (Dev Plugin)
+
+A Manifest V3 Chrome extension lives in `browser-extension/`. It gives you quick access to the scanner from any Chrome tab without opening the full web app — handy during development.
+
+### Load the extension in Chrome
+
+```bash
+# 1. Generate the icons (one-time, needs the server deps installed)
+npm install
+node browser-extension/generate-icons.js
+
+# 2. Start the dev server so the extension has something to talk to
+npm run dev
+```
+
+Then in Chrome:
+
+1. Go to `chrome://extensions`
+2. Enable **Developer mode** (top-right toggle)
+3. Click **Load unpacked** and select the `browser-extension/` folder
+4. Click the extension icon in the toolbar — the popup opens
+
+### Configure the server URL
+
+By default the extension points to `http://localhost:3000`. To change it:
+
+- Right-click the extension icon → **Options**, or
+- Click the ⚙️ icon inside the popup
+
+Enter your Vercel deployment URL to use the extension against production.
+
+### Extension files
+
+```
+browser-extension/
+  manifest.json          # Chrome Manifest V3
+  popup.html / .js / .css  # Extension popup UI
+  options.html / .js     # Settings page (server URL)
+  generate-icons.js      # One-time icon generator (uses Sharp)
+  icons/                 # Generated PNG icons (16, 48, 128 px)
+```
+
 ## Cost
 
 Each photo scan uses one GPT-4o vision request. At current pricing that's roughly **$0.01–0.04 per photo** depending on resolution.
