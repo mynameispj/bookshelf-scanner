@@ -145,10 +145,81 @@ function parseGptJson(raw) {
   return JSON.parse(text);
 }
 
+// JSON schemas for OpenAI Structured Outputs. Strict mode requires a top-level
+// object, every property listed in `required`, and additionalProperties: false.
+const BOOK_PROPS = {
+  title:      { type: "string" },
+  author:     { type: "string" },
+  confidence: { type: "string", enum: ["high", "medium", "low"] },
+};
+
+function booksSchema(extraProps = {}) {
+  const props = { ...BOOK_PROPS, ...extraProps };
+  return {
+    type: "object",
+    properties: {
+      books: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: props,
+          required: Object.keys(props),
+          additionalProperties: false,
+        },
+      },
+    },
+    required: ["books"],
+    additionalProperties: false,
+  };
+}
+
+const COUNT_SCHEMA = {
+  type: "object",
+  properties: {
+    count:   { type: "integer" },
+    shelves: { type: "integer" },
+    notes:   { type: "string" },
+  },
+  required: ["count", "shelves", "notes"],
+  additionalProperties: false,
+};
+const TILE_SCHEMA   = booksSchema();
+const VERIFY_SCHEMA = booksSchema({ corrected: { type: "boolean" } });
+const VISUAL_SCHEMA = booksSchema({ corrected: { type: "boolean" }, visible: { type: "boolean" } });
+
+/**
+ * Call GPT with a strict JSON schema and return the parsed object.
+ * Throws on refusals and on truncated output (callers fall back where they can).
+ */
+async function callJson({ model = "gpt-4o", max_tokens, messages, schemaName, schema, signal }) {
+  const completion = await openai.chat.completions.create(
+    {
+      model,
+      max_tokens,
+      messages,
+      response_format: {
+        type: "json_schema",
+        json_schema: { name: schemaName, strict: true, schema },
+      },
+    },
+    { signal }
+  );
+  const choice = completion.choices[0];
+  if (choice.message.refusal) {
+    throw new Error(`Model refused (${schemaName}): ${choice.message.refusal}`);
+  }
+  if (choice.finish_reason === "length") {
+    throw new Error(`Model output truncated (${schemaName}) — max_tokens reached`);
+  }
+  return parseGptJson(choice.message.content);
+}
+
 /** Pass 1 – quick count & overview using auto detail for accuracy */
-async function countBooks(dataUri) {
-  const completion = await openai.chat.completions.create({
-    model: "gpt-4o",
+async function countBooks(dataUri, signal) {
+  return callJson({
+    schemaName: "book_count",
+    schema: COUNT_SCHEMA,
+    signal,
     max_tokens: 1024,
     messages: [
       {
@@ -160,7 +231,7 @@ Include books that are sideways, stacked flat, partially hidden, or only partly 
 People commonly UNDERCOUNT books in photos — count carefully and err on the side of counting MORE.
 Look for thin spines, small paperbacks, and books partially hidden behind others.
 
-Return ONLY a JSON object with these fields, no markdown fences, no commentary:
+Return an object with these fields:
 {
   "count": <number>,
   "shelves": <number of distinct shelf rows visible>,
@@ -176,19 +247,20 @@ Return ONLY a JSON object with these fields, no markdown fences, no commentary:
       },
     ],
   });
-  return parseGptJson(completion.choices[0].message.content);
 }
 
 /** Pass 2 – identify books in a single tile */
-async function identifyBooksInTile(tileDataUri, tileLabel, overview, totalTiles) {
+async function identifyBooksInTile(tileDataUri, tileLabel, overview, totalTiles, signal) {
   // Omit the book count from the anchor hint — telling GPT "there are ~N books"
   // can pressure it to hallucinate entries to reach the expected number.
   const anchorHint = overview
     ? `The image shows ${overview.shelves} shelf/shelves. Layout: ${overview.notes}. You are looking at the ${tileLabel} section.`
     : `You are looking at the ${tileLabel} section of a bookshelf.`;
 
-  const completion = await openai.chat.completions.create({
-    model: "gpt-4o",
+  const result = await callJson({
+    schemaName: "tile_books",
+    schema: TILE_SCHEMA,
+    signal,
     max_tokens: 8192,
     messages: [
       {
@@ -233,9 +305,9 @@ CRITICAL RULES — READ CAREFULLY:
 - NEVER fill in books based on what "might" be on a shelf or what books are commonly owned. Every entry must be grounded in text or cover art you can actually see in this image.
 - When in doubt about whether something is a real book spine vs background, omit it.
 
-Return ONLY a JSON array, no markdown fences, no commentary.
-Example: [{"title":"Dune","author":"Frank Herbert","confidence":"high"},{"title":"1984","author":"George Orwell","confidence":"medium"}]
-If no books are visible in this section, return [].`,
+Return an object with a "books" array.
+Example: {"books":[{"title":"Dune","author":"Frank Herbert","confidence":"high"},{"title":"1984","author":"George Orwell","confidence":"medium"}]}
+If no books are visible in this section, return {"books":[]}.`,
       },
       {
         role: "user",
@@ -246,7 +318,7 @@ If no books are visible in this section, return [].`,
       },
     ],
   });
-  return parseGptJson(completion.choices[0].message.content);
+  return result.books;
 }
 
 // ---------------------------------------------------------------------------
@@ -318,18 +390,21 @@ function deduplicateBooks(allBooks) {
 // ---------------------------------------------------------------------------
 // Pass 3 – verification: text-only GPT call to fix title/author issues
 // ---------------------------------------------------------------------------
-async function verifyAndCleanBooks(books) {
+async function verifyAndCleanBooks(books, signal) {
   if (books.length === 0) return books;
 
   const bookListJson = JSON.stringify(books);
 
-  const completion = await openai.chat.completions.create({
-    model: "gpt-4o",
-    max_tokens: 4096,
-    messages: [
-      {
-        role: "system",
-        content: `You are a book-data quality checker. You will receive a JSON array of books identified from a bookshelf photo.
+  try {
+    const result = await callJson({
+      schemaName: "verified_books",
+      schema: VERIFY_SCHEMA,
+      signal,
+      max_tokens: 4096,
+      messages: [
+        {
+          role: "system",
+          content: `You are a book-data quality checker. You will receive a JSON array of books identified from a bookshelf photo.
 
 Your job is to FIX common errors:
 
@@ -346,22 +421,21 @@ Your job is to FIX common errors:
 
 For each book, preserve the original confidence field. If you made a correction, set "corrected": true on that entry.
 
-Return ONLY the corrected JSON array, no markdown fences, no commentary. Keep the same format:
-[{"title":"...","author":"...","confidence":"high|medium|low","corrected":true|false}]`,
-      },
-      {
-        role: "user",
-        content: `Please review and fix any issues in this book list:\n${bookListJson}`,
-      },
-    ],
-  });
-
-  try {
-    const cleaned = parseGptJson(completion.choices[0].message.content);
+Return an object with the corrected "books" array in the same format:
+{"books":[{"title":"...","author":"...","confidence":"high|medium|low","corrected":true|false}]}`,
+        },
+        {
+          role: "user",
+          content: `Please review and fix any issues in this book list:\n${bookListJson}`,
+        },
+      ],
+    });
+    const cleaned = result.books;
     console.log(`  Pass 3 (verify) → ${cleaned.filter(b => b.corrected).length} corrections made`);
     return cleaned;
   } catch (e) {
-    console.warn("  Pass 3 (verify) parse failed, using uncleaned results:", e.message);
+    if (signal?.aborted) throw e;
+    console.warn("  Pass 3 (verify) failed, using uncleaned results:", e.message);
     return books;
   }
 }
@@ -371,20 +445,23 @@ Return ONLY the corrected JSON array, no markdown fences, no commentary. Keep th
 // and ask it to confirm which books are actually visible on the shelf.
 // This is the primary defence against hallucinated books.
 // ---------------------------------------------------------------------------
-async function visuallyVerifyBooks(books, imageDataUri) {
+async function visuallyVerifyBooks(books, imageDataUri, signal) {
   if (books.length === 0) return books;
 
   const bookListText = books
-    .map((b, i) => `${i + 1}. "${b.title}" by ${b.author}`)
+    .map((b, i) => `${i + 1}. "${b.title}" by ${b.author} [confidence: ${b.confidence}, corrected: ${!!b.corrected}]`)
     .join("\n");
 
-  const completion = await openai.chat.completions.create({
-    model: "gpt-4o",
-    max_tokens: 4096,
-    messages: [
-      {
-        role: "system",
-        content: `You are a book verification assistant. You will receive a bookshelf photo and a list of books that were claimed to be identified from it.
+  try {
+    const result = await callJson({
+      schemaName: "visible_books",
+      schema: VISUAL_SCHEMA,
+      signal,
+      max_tokens: 4096,
+      messages: [
+        {
+          role: "system",
+          content: `You are a book verification assistant. You will receive a bookshelf photo and a list of books that were claimed to be identified from it.
 
 Your job: look at the actual photo and decide, for EACH book in the list, whether you can genuinely see that book's spine or cover in the image.
 
@@ -401,24 +478,22 @@ Mark a book "visible": false if:
 Do NOT over-reject: if you are genuinely unsure, lean toward visible=true.
 But hallucinated books — those with no matching spine anywhere — must be marked visible=false.
 
-Return ONLY a JSON array in this exact format, no markdown fences, no commentary:
-[{"title":"...","author":"...","confidence":"...","corrected":true|false,"visible":true}]`,
-      },
-      {
-        role: "user",
-        content: [
-          { type: "image_url", image_url: { url: imageDataUri, detail: "high" } },
-          {
-            type: "text",
-            text: `Here is the list of books the scanner identified. Please look at the photo and set "visible": true only for books whose spine or cover you can actually see:\n\n${bookListText}`,
-          },
-        ],
-      },
-    ],
-  });
-
-  try {
-    const verified = parseGptJson(completion.choices[0].message.content);
+Return an object with a "books" array containing EVERY book from the list, each with the same title, author, confidence and corrected values you were given, plus "visible":
+{"books":[{"title":"...","author":"...","confidence":"high|medium|low","corrected":true|false,"visible":true}]}`,
+        },
+        {
+          role: "user",
+          content: [
+            { type: "image_url", image_url: { url: imageDataUri, detail: "high" } },
+            {
+              type: "text",
+              text: `Here is the list of books the scanner identified. Please look at the photo and set "visible": true only for books whose spine or cover you can actually see:\n\n${bookListText}`,
+            },
+          ],
+        },
+      ],
+    });
+    const verified = result.books;
     const removed = verified.filter((b) => b.visible === false).map((b) => b.title);
     if (removed.length > 0) {
       console.log(`  Pass 4 (visual verify) → removed ${removed.length} unconfirmed book(s): ${removed.join(", ")}`);
@@ -430,7 +505,8 @@ Return ONLY a JSON array in this exact format, no markdown fences, no commentary
       .filter((b) => b.visible !== false)
       .map(({ visible: _v, ...rest }) => rest);
   } catch (e) {
-    console.warn("  Pass 4 (visual verify) parse failed, keeping unverified results:", e.message);
+    if (signal?.aborted) throw e;
+    console.warn("  Pass 4 (visual verify) failed, keeping unverified results:", e.message);
     return books;
   }
 }
@@ -449,66 +525,149 @@ app.post("/api/scan", (req, res, next) => {
     next();
   });
 }, async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ error: "No image uploaded" });
+  if (!req.file) return res.status(400).json({ error: "No image uploaded" });
 
+  // Clients that send `Accept: application/x-ndjson` get progress events as
+  // newline-delimited JSON while the scan runs; others get one JSON response.
+  const streaming = (req.headers.accept || "").includes("application/x-ndjson");
+
+  // Stop paying for GPT calls if the client goes away mid-scan.
+  const controller = new AbortController();
+  res.on("close", () => {
+    if (!res.writableFinished) controller.abort();
+  });
+
+  let emit = () => {};
+  if (streaming) {
+    res.status(200);
+    res.setHeader("Content-Type", "application/x-ndjson; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("X-Accel-Buffering", "no");
+    res.flushHeaders();
+    emit = (event) => {
+      if (!res.writableEnded) res.write(JSON.stringify(event) + "\n");
+    };
+  }
+
+  try {
     const imageBuffer = fs.readFileSync(req.file.path);
     const mimeType = req.file.mimetype || "image/jpeg";
+    const result = await runScan(imageBuffer, mimeType, emit, controller.signal);
 
-    // ── Pass 1: Quick count at low detail ─────────────────────
-    const fullUri = bufferToDataUri(imageBuffer, mimeType);
-    let overview = null;
-    try {
-      overview = await countBooks(fullUri);
-      console.log(`  Pass 1 → ~${overview.count} books, ${overview.shelves} shelves`);
-    } catch (e) {
-      console.warn("  Pass 1 (count) failed, continuing without anchor:", e.message);
+    if (streaming) {
+      emit({ type: "result", ...result });
+      res.end();
+    } else {
+      res.json(result);
     }
-
-    // ── Tile the image (adaptive grid based on book count) ───
-    const tiles = await tileImage(imageBuffer, overview);
-    console.log(`  Tiling → ${tiles.length} tile(s)`);
-
-    // ── Pass 2: Identify books in each tile + full image (parallel) ──
-    const tilePromises = tiles.map((tile) => {
-      const uri = bufferToDataUri(tile.buffer, "image/jpeg");
-      return identifyBooksInTile(uri, tile.label, overview, tiles.length);
-    });
-
-    // Also run identification on the full image for a holistic view
-    const fullImagePromise = identifyBooksInTile(fullUri, "full image (overview)", overview, tiles.length);
-
-    const [fullImageResult, ...tileResults] = await Promise.all([fullImagePromise, ...tilePromises]);
-
-    // Flatten tile results + full image results and deduplicate
-    const allBooks = [...fullImageResult, ...tileResults.flat()];
-    const dedupedBooks = deduplicateBooks(allBooks);
-
-    console.log(`  Pass 2 → ${allBooks.length} raw IDs, ${dedupedBooks.length} after dedup`);
-
-    // ── Pass 3: Verify & clean title/author data ──────────────
-    const pass3Books = await verifyAndCleanBooks(dedupedBooks);
-
-    // ── Pass 4: Visual confirmation – remove hallucinated books ──
-    const books = await visuallyVerifyBooks(pass3Books, fullUri);
-
-    console.log(`  Final → ${books.length} book(s) after all passes`);
-
-    // Clean up uploaded file
-    fs.unlink(req.file.path, () => {});
-
-    res.json({ books, overview });
   } catch (err) {
+    if (controller.signal.aborted) {
+      console.log("  Scan aborted — client disconnected");
+      return;
+    }
     console.error("Scan error:", err?.message || err);
-    if (err?.status === 401 || err?.code === "invalid_api_key") {
-      return res.status(500).json({ error: "OpenAI API key is missing or invalid. Check server configuration." });
+    const message = scanErrorMessage(err);
+    if (streaming) {
+      emit({ type: "error", error: message });
+      res.end();
+    } else {
+      res.status(500).json({ error: message });
     }
-    if (err?.code === "insufficient_quota") {
-      return res.status(500).json({ error: "OpenAI quota exceeded. Please check your billing." });
-    }
-    res.status(500).json({ error: err.message || "Failed to process image" });
+  } finally {
+    fs.unlink(req.file.path, () => {});
   }
 });
+
+/** Map an error from the scan pipeline to a user-facing message. */
+function scanErrorMessage(err) {
+  if (err?.status === 401 || err?.code === "invalid_api_key") {
+    return "OpenAI API key is missing or invalid. Check server configuration.";
+  }
+  if (err?.code === "insufficient_quota") {
+    return "OpenAI quota exceeded. Please check your billing.";
+  }
+  return err?.message || "Failed to process image";
+}
+
+/**
+ * Run the full identification pipeline. Calls emit(event) with progress:
+ *   {type:"stage", stage, message}
+ *   {type:"overview", overview}
+ *   {type:"tile", label, done, total, books}   (books = cumulative deduped list)
+ *   {type:"warning", label, message}
+ * Returns { books, overview }.
+ */
+async function runScan(imageBuffer, mimeType, emit, signal) {
+  // ── Pass 1: Quick count ───────────────────────────────────
+  emit({ type: "stage", stage: "count", message: "Counting books & shelves…" });
+  const fullUri = bufferToDataUri(imageBuffer, mimeType);
+  let overview = null;
+  try {
+    overview = await countBooks(fullUri, signal);
+    console.log(`  Pass 1 → ~${overview.count} books, ${overview.shelves} shelves`);
+    emit({ type: "overview", overview });
+  } catch (e) {
+    if (signal.aborted) throw e;
+    console.warn("  Pass 1 (count) failed, continuing without anchor:", e.message);
+  }
+
+  // ── Tile the image (adaptive grid based on book count) ───
+  const tiles = await tileImage(imageBuffer, overview);
+  console.log(`  Tiling → ${tiles.length} tile(s)`);
+
+  // ── Pass 2: Identify books in each tile + full image (parallel) ──
+  const jobs = [
+    { label: "full image (overview)", uri: fullUri },
+    ...tiles.map((tile) => ({ label: tile.label, uri: bufferToDataUri(tile.buffer, "image/jpeg") })),
+  ];
+  emit({
+    type: "stage",
+    stage: "identify",
+    message: `Reading spines in ${jobs.length} section${jobs.length === 1 ? "" : "s"}…`,
+  });
+
+  const allBooks = [];
+  let done = 0;
+  const settled = await Promise.allSettled(
+    jobs.map((job) =>
+      identifyBooksInTile(job.uri, job.label, overview, tiles.length, signal).then(
+        (books) => {
+          allBooks.push(...books);
+          done++;
+          emit({ type: "tile", label: job.label, done, total: jobs.length, books: deduplicateBooks(allBooks) });
+          return books;
+        },
+        (err) => {
+          done++;
+          if (!signal.aborted) {
+            console.warn(`  Pass 2 (${job.label}) failed:`, err.message);
+            emit({ type: "warning", label: job.label, message: `Couldn't read section ${job.label}` });
+            emit({ type: "tile", label: job.label, done, total: jobs.length, books: deduplicateBooks(allBooks) });
+          }
+          throw err;
+        }
+      )
+    )
+  );
+
+  if (signal.aborted) throw new Error("Scan aborted");
+  const failures = settled.filter((s) => s.status === "rejected");
+  if (failures.length === jobs.length) throw failures[0].reason; // nothing worked
+
+  const dedupedBooks = deduplicateBooks(allBooks);
+  console.log(`  Pass 2 → ${allBooks.length} raw IDs, ${dedupedBooks.length} after dedup (${failures.length} section(s) failed)`);
+
+  // ── Pass 3: Verify & clean title/author data ──────────────
+  emit({ type: "stage", stage: "verify", message: "Checking titles & authors…" });
+  const pass3Books = await verifyAndCleanBooks(dedupedBooks, signal);
+
+  // ── Pass 4: Visual confirmation – remove hallucinated books ──
+  emit({ type: "stage", stage: "visual", message: "Double-checking every book against the photo…" });
+  const books = await visuallyVerifyBooks(pass3Books, fullUri, signal);
+
+  console.log(`  Final → ${books.length} book(s) after all passes`);
+  return { books, overview };
+}
 
 // ---------------------------------------------------------------------------
 // POST /api/lookup  – look up ISBN + metadata via Open Library

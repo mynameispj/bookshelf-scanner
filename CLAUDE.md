@@ -50,16 +50,24 @@ Copy `.env.example` to `.env` and fill in values.
 
 The scanning process is a multi-pass pipeline:
 
-1. **Pass 1 — Count:** Quick GPT-4o call at "low" detail to estimate book count (cheap)
-2. **Pass 2 — Identify:** Adaptive image tiling (2-4 cols, 1-4 rows based on count) with 15% overlap, parallel GPT-4o "high" detail calls per tile
-3. **Pass 3 — Verify:** Text-only GPT call to fix hallucinated titles/authors
-4. **Deduplication:** Merge results across overlapping tiles, keep highest confidence
+All passes live in `runScan()` and use OpenAI Structured Outputs (`callJson()` with a strict JSON schema), so responses always parse.
+
+1. **Pass 1 — Count:** Quick GPT-4o call to estimate book count and shelf layout
+2. **Pass 2 — Identify:** Adaptive image tiling (2-4 cols, 2-4 rows) with 25% overlap, plus one full-image pass; parallel GPT-4o "high" detail calls via `Promise.allSettled` (a failed section is skipped, not fatal)
+3. **Deduplication:** Merge results across overlapping tiles, keep highest confidence
+4. **Pass 3 — Verify:** Text-only GPT call to fix title/author mix-ups
+5. **Pass 4 — Visual verify:** Re-show the full image with the list; drop books GPT can't find on the shelf
+
+### Streaming scan results
+
+`POST /api/scan` with `Accept: application/x-ndjson` streams newline-delimited JSON events while the scan runs:
+`stage` (progress message), `overview` (Pass 1), `tile` (cumulative deduped books after each section), `warning` (a section failed), then `result` (final books) or `error`. Without that header it returns a single JSON `{ books, overview }`. The frontend shows books on the review screen as they arrive (read-only until `result`). If the client disconnects, the server aborts the remaining GPT calls.
 
 ### API Endpoints
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/api/scan` | POST | Upload image → returns identified books (multipart form) |
+| `/api/scan` | POST | Upload image → identified books (multipart form; NDJSON stream if requested) |
 | `/api/lookup` | POST | Enrich book list with ISBN & metadata from Open Library |
 
 ### Frontend Flow
@@ -67,7 +75,7 @@ The scanning process is a multi-pass pipeline:
 Three-step wizard: **Capture** → **Review & Edit** → **Export CSV**
 
 - Client-side image compression before upload (max 3200px, JPEG quality 0.80)
-- 270s client timeout (fits within Vercel's 300s limit)
+- 270s client timeout (fits within Vercel's 300s limit); books found before a timeout are kept and marked unverified
 
 ## Key Conventions
 

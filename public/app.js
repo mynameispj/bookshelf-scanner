@@ -25,6 +25,7 @@ const btnDownload  = $("#btn-download-csv");
 const btnStartOver = $("#btn-start-over");
 const loading     = $("#loading");
 const loadingText = $("#loading-text");
+const scanProgress = $("#scan-progress");
 
 // ── Utilities ───────────────────────────────────────────────────────────────
 function showLoading(msg) { loadingText.textContent = msg; loading.classList.remove("hidden"); }
@@ -99,75 +100,145 @@ btnScan.addEventListener("click", async () => {
     photoBlob = selectedFile;
   }
 
-  showLoading("Step 1/4: Enhancing image & counting books…");
+  showLoading("Uploading photo…");
 
   const formData = new FormData();
   formData.append("photo", photoBlob, selectedFile.name || "photo.jpg");
-
-  // Animate through loading stages to keep user informed
-  const stages = [
-    { delay: 4000,  msg: "Step 2/5: Counting books & shelves…" },
-    { delay: 10000, msg: "Step 3/5: Splitting image into sections for accuracy…" },
-    { delay: 18000, msg: "Step 4/5: Identifying every book in each section…" },
-    { delay: 40000, msg: "Step 5/5: Verifying & cleaning titles and authors…" },
-    { delay: 60000, msg: "Still working — scanning all shelves thoroughly…" },
-    { delay: 90000, msg: "Large bookshelf — checking for missed books…" },
-    { delay: 130000, msg: "Almost there — wrapping up identification…" },
-  ];
-  const timers = stages.map(s => setTimeout(() => showLoading(s.msg), s.delay));
 
   // Abort after 4.5 minutes to stay within Vercel's 5-minute limit
   const controller = new AbortController();
   const abortTimer = setTimeout(() => controller.abort(), 270000);
 
-  try {
-    const res = await fetch("/api/scan", { method: "POST", body: formData, signal: controller.signal });
+  // Books shown on the review screen while the scan is still running
+  let gotPartial = false;
+  let progress = { done: 0, total: 0, stage: "" };
 
-    // Handle non-JSON error responses (e.g. Vercel HTML error pages)
+  function onScanEvent(ev) {
+    switch (ev.type) {
+      case "stage":
+        progress.stage = ev.message;
+        if (gotPartial) renderScanProgress(progress);
+        else showLoading(ev.message);
+        break;
+      case "tile":
+        progress.done = ev.done;
+        progress.total = ev.total;
+        identifiedBooks = ev.books;
+        if (!gotPartial) {
+          gotPartial = true;
+          hideLoading();
+          setStep(2);
+          showStep(stepReview);
+        }
+        renderReviewList({ pending: true });
+        renderScanProgress(progress);
+        break;
+      case "warning":
+        console.warn("Scan warning:", ev.message);
+        break;
+      case "result":
+        identifiedBooks = ev.books;
+        break;
+      case "error":
+        throw new Error(ev.error);
+    }
+  }
+
+  try {
+    const res = await fetch("/api/scan", {
+      method: "POST",
+      body: formData,
+      headers: { Accept: "application/x-ndjson" },
+      signal: controller.signal,
+    });
+
     const contentType = res.headers.get("content-type") || "";
-    if (!contentType.includes("application/json")) {
+    if (contentType.includes("application/x-ndjson")) {
+      await readNdjson(res, onScanEvent);
+    } else if (contentType.includes("application/json")) {
+      // Errors raised before streaming starts (upload too large, no file, …)
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error);
+      identifiedBooks = data.books;
+    } else {
+      // Non-JSON error responses (e.g. Vercel HTML error pages)
       const text = await res.text();
       if (res.status === 413) throw new Error("Image too large. Please use a smaller photo.");
       if (res.status >= 500) throw new Error(`Server error (${res.status}). Please try again in a moment.`);
       throw new Error(`Unexpected response (${res.status}): ${text.slice(0, 120)}`);
     }
 
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error);
-
-    identifiedBooks = data.books;
+    renderScanProgress(null);
     renderReviewList();
     setStep(2);
     showStep(stepReview);
   } catch (err) {
+    renderScanProgress(null);
+    if (gotPartial) {
+      // Keep what we already found so the user doesn't lose it.
+      identifiedBooks.forEach((b) => { b.unverified = true; });
+      renderReviewList();
+    }
+    const partialNote = gotPartial ? "\n\nThe books found so far are kept — marked as unverified." : "";
     if (err.name === "AbortError") {
-      alert("Scan timed out. Try a smaller or clearer photo with fewer books.");
+      alert("Scan timed out. Try a smaller or clearer photo with fewer books." + partialNote);
     } else if (err instanceof TypeError) {
       // TypeError from fetch = network-level failure (connection refused, DNS, CORS, etc.)
       console.error("Network error during scan:", err);
       alert("Scan failed: Could not reach the server. Check your internet connection and try again.\n\nIf the problem persists, the image may be too large — try a lower-resolution photo.");
     } else {
-      alert("Scan failed: " + (err.message || "Unknown error"));
+      alert("Scan failed: " + (err.message || "Unknown error") + partialNote);
     }
   } finally {
     clearTimeout(abortTimer);
-    timers.forEach(clearTimeout);
     hideLoading();
   }
 });
 
+/** Read a newline-delimited JSON response, calling onEvent for each line. */
+async function readNdjson(res, onEvent) {
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  for (;;) {
+    const { value, done } = await reader.read();
+    buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+    let nl;
+    while ((nl = buffer.indexOf("\n")) >= 0) {
+      const line = buffer.slice(0, nl).trim();
+      buffer = buffer.slice(nl + 1);
+      if (line) onEvent(JSON.parse(line));
+    }
+    if (done) break;
+  }
+  if (buffer.trim()) onEvent(JSON.parse(buffer));
+}
+
+/** Show (or hide, with null) the live progress banner above the book list. */
+function renderScanProgress(p) {
+  if (!p) { scanProgress.classList.add("hidden"); return; }
+  const sections = p.total ? `${p.done}/${p.total} sections read` : "";
+  scanProgress.innerHTML = `<span class="spinner-sm"></span><span>${escHtml(p.stage || "Scanning…")}${sections ? ` · ${sections}` : ""}</span>`;
+  scanProgress.classList.remove("hidden");
+}
+
 // ── Step 2: Review list ─────────────────────────────────────────────────────
-function renderReviewList() {
-  const highCount = identifiedBooks.filter(b => b.confidence === "high").length;
+// pending = scan still running: show books read-only and disable actions.
+function renderReviewList({ pending = false } = {}) {
   const lowCount  = identifiedBooks.filter(b => b.confidence === "low").length;
-  let hint = `Found ${identifiedBooks.length} book(s).`;
-  if (lowCount > 0) hint += ` ${lowCount} flagged low-confidence — please double-check those.`;
-  else hint += " Edit titles/authors or remove mistakes.";
+  let hint = `Found ${identifiedBooks.length} book(s)`;
+  if (pending) hint += " so far — still scanning. You can edit once it's done.";
+  else if (lowCount > 0) hint += `. ${lowCount} flagged low-confidence — please double-check those.`;
+  else hint += ". Edit titles/authors or remove mistakes.";
   reviewHint.textContent = hint;
+  btnLookup.disabled = pending;
+  btnAddManual.disabled = pending;
   bookList.innerHTML = "";
 
   if (identifiedBooks.length === 0) {
-    bookList.innerHTML = '<div class="empty-state"><p>No books detected yet. Try scanning a clearer photo, or add books manually below.</p></div>';
+    bookList.innerHTML = pending
+      ? '<div class="empty-state"><p>Reading the shelf…</p></div>'
+      : '<div class="empty-state"><p>No books detected yet. Try scanning a clearer photo, or add books manually below.</p></div>';
     return;
   }
 
@@ -175,15 +246,17 @@ function renderReviewList() {
     const conf = book.confidence || "high";
     const confLabel = conf === "high" ? "✅ High" : conf === "medium" ? "🟡 Medium" : "🔴 Low";
     const correctedTag = book.corrected ? ' <span class="corrected-tag">✏️ auto-corrected</span>' : '';
+    const unverifiedTag = book.unverified ? ' <span class="corrected-tag">⚠ unverified</span>' : '';
+    const dis = pending ? "disabled" : "";
     const card = document.createElement("div");
-    card.className = `book-card confidence-${conf}`;
+    card.className = `book-card confidence-${conf}${pending ? " pending" : ""}`;
     card.innerHTML = `
       <div class="info">
-        <input type="text" data-idx="${i}" data-field="title" value="${esc(book.title)}" placeholder="Title" />
-        <input type="text" data-idx="${i}" data-field="author" value="${esc(book.author)}" placeholder="Author" />
-        <span class="meta conf-badge conf-${conf}">${confLabel} confidence${correctedTag}</span>
+        <input type="text" data-idx="${i}" data-field="title" value="${esc(book.title)}" placeholder="Title" ${dis} />
+        <input type="text" data-idx="${i}" data-field="author" value="${esc(book.author)}" placeholder="Author" ${dis} />
+        <span class="meta conf-badge conf-${conf}">${confLabel} confidence${correctedTag}${unverifiedTag}</span>
       </div>
-      <button class="btn btn-danger remove" data-idx="${i}">✕</button>
+      ${pending ? "" : `<button class="btn btn-danger remove" data-idx="${i}">✕</button>`}
     `;
     bookList.appendChild(card);
   });
@@ -207,6 +280,9 @@ function renderReviewList() {
 }
 
 function esc(s) { return (s || "").replace(/"/g, "&quot;"); }
+function escHtml(s) {
+  return String(s || "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
 
 // Add manual book
 btnAddManual.addEventListener("click", () => {
