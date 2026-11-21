@@ -527,6 +527,21 @@ app.post("/api/scan", (req, res, next) => {
 }, async (req, res) => {
   if (!req.file) return res.status(400).json({ error: "No image uploaded" });
 
+  // Reject formats we can't decode (e.g. HEIC) before streaming starts, so the
+  // client gets a normal JSON error with a helpful message.
+  let imageBuffer;
+  try {
+    imageBuffer = fs.readFileSync(req.file.path);
+    const meta = await sharp(imageBuffer).metadata();
+    if (!meta.width || !meta.height) throw new Error("no dimensions");
+  } catch {
+    fs.unlink(req.file.path, () => {});
+    return res.status(415).json({
+      error: "Couldn't read this image format — please upload a JPEG or PNG. " +
+        "On iPhone: Settings → Camera → Formats → Most Compatible.",
+    });
+  }
+
   // Clients that send `Accept: application/x-ndjson` get progress events as
   // newline-delimited JSON while the scan runs; others get one JSON response.
   const streaming = (req.headers.accept || "").includes("application/x-ndjson");
@@ -550,7 +565,6 @@ app.post("/api/scan", (req, res, next) => {
   }
 
   try {
-    const imageBuffer = fs.readFileSync(req.file.path);
     const mimeType = req.file.mimetype || "image/jpeg";
     const result = await runScan(imageBuffer, mimeType, emit, controller.signal);
 

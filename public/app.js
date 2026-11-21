@@ -43,14 +43,23 @@ function setStep(n) {
  * Compress an image file to stay under Vercel's 4.5 MB body limit.
  * Resizes to max 3200px on longest side and uses JPEG quality 0.80.
  * This preserves enough spine-text detail for GPT while keeping size ~2-3 MB.
- * Returns a Blob ready for FormData.
+ * Skips re-encoding photos that are already small, and never returns a file
+ * bigger than the original. Rejects if the browser can't decode the image
+ * (e.g. HEIC on desktop) — the caller then uploads the original.
  */
 function compressImage(file, maxDim = 3200, quality = 0.80) {
   return new Promise((resolve, reject) => {
     const img = new Image();
+    const url = URL.createObjectURL(file);
     img.onload = () => {
-      let { width, height } = img;
-      if (width > maxDim || height > maxDim) {
+      URL.revokeObjectURL(url);
+      let { naturalWidth: width, naturalHeight: height } = img;
+      const fitsAlready = width <= maxDim && height <= maxDim;
+      if (fitsAlready && file.size < 2.5 * 1024 * 1024 && /jpe?g|png/i.test(file.type)) {
+        resolve(file); // small enough already — re-encoding would only lose detail
+        return;
+      }
+      if (!fitsAlready) {
         const ratio = Math.min(maxDim / width, maxDim / height);
         width  = Math.round(width * ratio);
         height = Math.round(height * ratio);
@@ -61,13 +70,19 @@ function compressImage(file, maxDim = 3200, quality = 0.80) {
       const ctx = canvas.getContext("2d");
       ctx.drawImage(img, 0, 0, width, height);
       canvas.toBlob(
-        (blob) => (blob ? resolve(blob) : reject(new Error("Canvas compression failed"))),
+        (blob) => {
+          if (!blob) return reject(new Error("Canvas compression failed"));
+          resolve(blob.size < file.size ? blob : file);
+        },
         "image/jpeg",
         quality
       );
     };
-    img.onerror = () => reject(new Error("Could not load image for compression"));
-    img.src = URL.createObjectURL(file);
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error("Could not load image for compression"));
+    };
+    img.src = url;
   });
 }
 
@@ -144,13 +159,26 @@ btnScan.addEventListener("click", async () => {
     }
   }
 
+  const postScan = () => fetch("/api/scan", {
+    method: "POST",
+    body: formData,
+    headers: { Accept: "application/x-ndjson" },
+    signal: controller.signal,
+  });
+
   try {
-    const res = await fetch("/api/scan", {
-      method: "POST",
-      body: formData,
-      headers: { Accept: "application/x-ndjson" },
-      signal: controller.signal,
-    });
+    let res;
+    try {
+      res = await postScan();
+    } catch (netErr) {
+      // One automatic retry if the network dropped before the server answered.
+      // (Never retry once results have started streaming — that would pay for the scan twice.)
+      if (!(netErr instanceof TypeError)) throw netErr;
+      console.warn("Network error starting scan, retrying once:", netErr);
+      showLoading("Connection hiccup — retrying…");
+      await new Promise((r) => setTimeout(r, 1500));
+      res = await postScan();
+    }
 
     const contentType = res.headers.get("content-type") || "";
     if (contentType.includes("application/x-ndjson")) {
@@ -164,6 +192,7 @@ btnScan.addEventListener("click", async () => {
       // Non-JSON error responses (e.g. Vercel HTML error pages)
       const text = await res.text();
       if (res.status === 413) throw new Error("Image too large. Please use a smaller photo.");
+      if (res.status === 415) throw new Error("Couldn't read this image format — please upload a JPEG or PNG.");
       if (res.status >= 500) throw new Error(`Server error (${res.status}). Please try again in a moment.`);
       throw new Error(`Unexpected response (${res.status}): ${text.slice(0, 120)}`);
     }
