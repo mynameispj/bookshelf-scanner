@@ -220,6 +220,53 @@ main {
   .book-card.pending, .spinner-sm { animation: none; }
 }
 .btn:disabled { opacity: .5; cursor: not-allowed; }
+/* .btn sets display, which would otherwise override the generic .hidden rule */
+.btn.hidden { display: none; }
+
+/* ── Barcode scanning ── */
+.barcode-entry { margin-top: 1.25rem; padding-top: 1rem; border-top: 1px solid var(--clr-border); text-align: center; }
+.barcode-entry .hint { margin-bottom: .6rem; }
+#barcode-overlay {
+  position: fixed; inset: 0; z-index: 90;
+  background: rgba(0,0,0,.6);
+  display: flex; align-items: center; justify-content: center;
+  padding: 16px;
+}
+#barcode-overlay.hidden { display: none; }
+.barcode-panel {
+  background: var(--clr-surface); border-radius: var(--radius); box-shadow: var(--shadow);
+  width: 100%; max-width: 480px; max-height: calc(100vh - 32px); overflow-y: auto;
+  padding: 1rem;
+}
+.barcode-panel h2 { font-size: 1.1rem; margin-bottom: .75rem; }
+.barcode-video-wrap {
+  position: relative; background: #111; border-radius: 8px; overflow: hidden;
+  aspect-ratio: 4 / 3;
+}
+#barcode-video { width: 100%; height: 100%; object-fit: cover; display: block; }
+.barcode-guide {
+  position: absolute; left: 12%; right: 12%; top: 35%; bottom: 35%;
+  border: 2px solid rgba(255,255,255,.85); border-radius: 6px;
+  box-shadow: 0 0 0 9999px rgba(0,0,0,.25);
+}
+#barcode-overlay.flash .barcode-guide { animation: barcode-flash .5s ease-out; }
+@keyframes barcode-flash { from { border-color: #4ade80; background: rgba(74,222,128,.35); } }
+#barcode-status { margin: .6rem 0; min-height: 1.4em; }
+.barcode-manual { display: flex; gap: .5rem; }
+.barcode-manual input {
+  flex: 1; min-width: 0; padding: .55rem .7rem; font-size: 1rem;
+  border: 1px solid var(--clr-border); border-radius: 6px;
+}
+#barcode-list { list-style: none; margin: .75rem 0 0; padding: 0; }
+#barcode-list li {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: .35rem 0; border-bottom: 1px solid var(--clr-border);
+  font-variant-numeric: tabular-nums;
+}
+.btn-sm { padding: .2rem .5rem; font-size: .75rem; }
+@media (prefers-reduced-motion: reduce) {
+  #barcode-overlay.flash .barcode-guide { animation: none; }
+}
 
 /* ── Catalog check tags ── */
 .corrected-tag.catalog-found   { color: #15803d; }

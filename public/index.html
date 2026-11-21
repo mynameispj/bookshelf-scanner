@@ -51,6 +51,10 @@
         <img id="preview-img" alt="Preview" />
         <button class="btn btn-primary" id="btn-scan" disabled>🔍 Scan for Books</button>
       </div>
+      <div class="barcode-entry">
+        <p class="hint">Books with a barcode on the back? Scan them for an exact match — no guessing.</p>
+        <button class="btn btn-outline" id="btn-barcode">🏷️ Scan ISBN Barcodes</button>
+      </div>
     </section>
 
     <!-- ── Step 2: Review ───────────────────────────────────────── -->
@@ -65,6 +69,7 @@
       </div>
       <div class="actions">
         <button class="btn btn-secondary" id="btn-add-manual">＋ Add Book Manually</button>
+        <button class="btn btn-secondary" id="btn-add-barcode">🏷️ Add by Barcode</button>
         <button class="btn btn-secondary hidden" id="btn-remove-low"></button>
         <button class="btn btn-primary" id="btn-lookup">🔎 Look Up ISBNs &amp; Metadata</button>
       </div>
@@ -82,6 +87,28 @@
       </div>
     </section>
 
+    <!-- ── Barcode scanner overlay ──────────────────────────────── -->
+    <div id="barcode-overlay" class="hidden" role="dialog" aria-modal="true" aria-labelledby="barcode-title">
+      <div class="barcode-panel">
+        <h2 id="barcode-title">🏷️ Scan ISBN Barcodes</h2>
+        <div class="barcode-video-wrap">
+          <video id="barcode-video" muted playsinline></video>
+          <div class="barcode-guide" aria-hidden="true"></div>
+        </div>
+        <p id="barcode-status" class="hint" role="status" aria-live="polite">Starting camera…</p>
+        <form id="barcode-manual" class="barcode-manual">
+          <input type="text" id="barcode-manual-input" inputmode="numeric" autocomplete="off"
+                 placeholder="…or type an ISBN" aria-label="Type an ISBN" />
+          <button type="submit" class="btn btn-secondary">Add</button>
+        </form>
+        <ul id="barcode-list" aria-label="Scanned ISBNs"></ul>
+        <div class="actions">
+          <button class="btn btn-secondary" id="barcode-cancel">Cancel</button>
+          <button class="btn btn-primary" id="barcode-done" disabled>Done</button>
+        </div>
+      </div>
+    </div>
+
     <!-- ── Loading overlay ──────────────────────────────────────── -->
     <div id="loading" class="hidden">
       <div class="spinner"></div>
@@ -93,6 +120,10 @@
     <p>Powered by OpenAI Vision &amp; Open Library &middot; Exports CSV for <a href="https://www.libib.com" target="_blank">Libib</a></p>
   </footer>
 
+  <!-- Barcode decoding (ZXing). Loaded from a CDN, pinned with an integrity hash. -->
+  <script src="https://cdn.jsdelivr.net/npm/@zxing/browser@0.2.1/umd/zxing-browser.min.js"
+          integrity="sha384-HRtzk9lZgkbSgvUyQrnfC/GxiXZgwaNyD7hC9wcXlsBpDhkS80ISl73juef2FRuf"
+          crossorigin="anonymous" defer></script>
   <script src="app.js"></script>
 </body>
 </html>
