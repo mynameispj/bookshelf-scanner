@@ -773,7 +773,12 @@ async function searchOpenLibraryByTitle(title, limit = 5, signal) {
 async function googleBooksDocs(title, author, signal) {
   const terms = [`intitle:"${title.replace(/"/g, "")}"`];
   if (author && author !== "Unknown") terms.push(`inauthor:"${author.replace(/"/g, "")}"`);
-  let url = `https://www.googleapis.com/books/v1/volumes?q=${encodeURIComponent(terms.join(" "))}&maxResults=5&printType=books`;
+  return googleBooksQuery(terms.join(" "), signal);
+}
+
+/** Run a raw Google Books query (e.g. `isbn:978…`) and map results to doc shape. */
+async function googleBooksQuery(q, signal) {
+  let url = `https://www.googleapis.com/books/v1/volumes?q=${encodeURIComponent(q)}&maxResults=5&printType=books`;
   const key = (process.env.GOOGLE_BOOKS_API_KEY || "").trim();
   if (key) url += `&key=${encodeURIComponent(key)}`;
   const data = await fetchJson(url, signal);
@@ -893,6 +898,81 @@ async function catalogCheck(books, parentSignal) {
   return checked;
 }
 
+// ---------------------------------------------------------------------------
+// ISBN helpers – barcode scanning and typed ISBNs
+// ---------------------------------------------------------------------------
+
+/** True if a 13-digit string has a valid EAN-13 check digit. */
+function isValidIsbn13(s) {
+  if (!/^\d{13}$/.test(s)) return false;
+  const sum = [...s.slice(0, 12)].reduce((acc, d, i) => acc + Number(d) * (i % 2 ? 3 : 1), 0);
+  return (10 - (sum % 10)) % 10 === Number(s[12]);
+}
+
+/** True if a 10-character string is a valid ISBN-10 (last char may be X). */
+function isValidIsbn10(s) {
+  if (!/^\d{9}[\dX]$/.test(s)) return false;
+  const sum = [...s].reduce((acc, c, i) => acc + (c === "X" ? 10 : Number(c)) * (10 - i), 0);
+  return sum % 11 === 0;
+}
+
+/** Normalize any ISBN-10/13 input to a valid book ISBN-13, or null. */
+function toIsbn13(input) {
+  const s = String(input || "").toUpperCase().replace(/[^0-9X]/g, "");
+  if (s.length === 13) return /^97[89]/.test(s) && isValidIsbn13(s) ? s : null;
+  if (s.length === 10 && isValidIsbn10(s)) {
+    const base = "978" + s.slice(0, 9);
+    const sum = [...base].reduce((acc, d, i) => acc + Number(d) * (i % 2 ? 3 : 1), 0);
+    return base + ((10 - (sum % 10)) % 10);
+  }
+  return null;
+}
+
+/** ISBN-10 for a 978-prefixed ISBN-13 (979 ISBNs have no ISBN-10). */
+function isbn13To10(isbn13) {
+  if (!isbn13.startsWith("978")) return "";
+  const core = isbn13.slice(3, 12);
+  const sum = [...core].reduce((acc, d, i) => acc + Number(d) * (10 - i), 0);
+  const check = (11 - (sum % 11)) % 11;
+  return core + (check === 10 ? "X" : String(check));
+}
+
+/**
+ * Exact lookup by ISBN: Open Library first, then Google Books. The scanned
+ * ISBN is always kept (a work-level match may list other editions' ISBNs),
+ * so even an unmatched barcode still exports to Libib by ISBN.
+ */
+async function lookupByIsbn(isbn13, book = {}) {
+  const sources = [
+    () => openLibraryDocs("isbn", isbn13, 1),
+    () => openLibraryDocs("isbn", isbn13, 1), // one retry: Open Library is sometimes slow
+    () => googleBooksQuery(`isbn:${isbn13}`),
+  ];
+  let answered = false; // did any catalog actually respond (vs. time out / error)?
+  for (let i = 0; i < sources.length; i++) {
+    if (i === 1 && answered) continue; // Open Library answered "no match": don't retry it
+    try {
+      const [doc] = await sources[i]();
+      answered = true;
+      if (doc) {
+        return { ...docToResult(doc, book), isbn13, isbn10: isbn13To10(isbn13), source: book.source };
+      }
+    } catch {
+      // catalog unreachable — try the next one
+    }
+  }
+  return {
+    title: book.title || "",
+    author: book.author || "",
+    isbn13,
+    isbn10: isbn13To10(isbn13),
+    coverUrl: null,
+    source: book.source,
+    matched: false,
+    lookupFailed: !answered, // true = catalogs unreachable, not "this ISBN doesn't exist"
+  };
+}
+
 /** Build an enriched book result from an Open Library doc */
 function docToResult(doc, originalBook) {
   const isbn13 = (doc.isbn || []).find((i) => i.length === 13) || "";
@@ -919,6 +999,10 @@ function docToResult(doc, originalBook) {
  * tries Open Library strategies, then Google Books.
  */
 async function lookupOneBook(book) {
+  // Books added by barcode (or with a typed ISBN) are looked up exactly.
+  const isbn13 = toIsbn13(book.isbn13 || book.isbn10 || book.isbn);
+  if (isbn13) return lookupByIsbn(isbn13, book);
+
   const cached = book.catalogMatch;
   if (cached?.matched && cached.matchedFor === catalogKey(book)) {
     const { matchedFor: _k, ...result } = cached;
@@ -990,8 +1074,11 @@ app.post("/api/lookup", async (req, res) => {
     const { books } = req.body;
     if (!Array.isArray(books))
       return res.status(400).json({ error: "books must be an array" });
+    if (books.length > 500)
+      return res.status(400).json({ error: "Too many books in one lookup (max 500)" });
 
-    const results = await Promise.all(books.map(lookupOneBook));
+    // Limit concurrency so a big batch of barcodes doesn't flood Open Library
+    const results = await mapWithLimit(books, 6, lookupOneBook);
 
     res.json({ books: results });
   } catch (err) {

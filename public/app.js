@@ -20,6 +20,7 @@ const bookList    = $("#book-list");
 const reviewHint  = $("#review-hint");
 const btnAddManual = $("#btn-add-manual");
 const btnRemoveLow = $("#btn-remove-low");
+const btnAddBarcode = $("#btn-add-barcode");
 const btnLookup   = $("#btn-lookup");
 const enrichedList = $("#enriched-list");
 const btnDownload  = $("#btn-download-csv");
@@ -263,6 +264,7 @@ function renderReviewList({ pending = false } = {}) {
   reviewHint.textContent = hint;
   btnLookup.disabled = pending;
   btnAddManual.disabled = pending;
+  btnAddBarcode.disabled = pending;
   btnRemoveLow.disabled = pending;
   btnRemoveLow.classList.toggle("hidden", pending || lowCount === 0);
   btnRemoveLow.textContent = `🗑 Remove ${lowCount} below ${LOW_CONFIDENCE}%`;
@@ -287,13 +289,19 @@ function renderReviewList({ pending = false } = {}) {
         ? ' <span class="corrected-tag catalog-missing">⚠ Not in any catalog — double-check</span>'
         : '';
     const dis = pending ? "disabled" : "";
+    const badge = book.source === "barcode"
+      ? `<span class="meta conf-badge conf-high">🏷️ Barcode · ISBN ${escHtml(book.isbn13)}${
+          book.matched !== false ? ''
+          : book.lookupFailed ? ' <span class="corrected-tag catalog-missing">⚠ catalogs didn\'t respond — will retry at lookup</span>'
+          : ' <span class="corrected-tag catalog-missing">⚠ not found in catalogs — add title</span>'}</span>`
+      : `<span class="meta conf-badge conf-${conf}">${confLabel} confidence${correctedTag}${unverifiedTag}${catalogTag}</span>`;
     const card = document.createElement("div");
     card.className = `book-card confidence-${conf}${pending ? " pending" : ""}`;
     card.innerHTML = `
       <div class="info">
         <input type="text" data-idx="${i}" data-field="title" value="${esc(book.title)}" placeholder="Title" ${dis} />
         <input type="text" data-idx="${i}" data-field="author" value="${esc(book.author)}" placeholder="Author" ${dis} />
-        <span class="meta conf-badge conf-${conf}">${confLabel} confidence${correctedTag}${unverifiedTag}${catalogTag}</span>
+        ${badge}
       </div>
       ${pending ? "" : `<button class="btn btn-danger remove" data-idx="${i}">✕</button>`}
     `;
@@ -444,6 +452,181 @@ btnDownload.addEventListener("click", () => {
   a.click();
   URL.revokeObjectURL(url);
 });
+
+// ── ISBN barcode scanning ───────────────────────────────────────────────────
+// Uses ZXing (loaded from a CDN in index.html) to read EAN-13 barcodes from the
+// camera. Book barcodes are ISBN-13s starting 978/979. Scanned ISBNs are looked
+// up exactly via /api/lookup and added to the review list at 100% confidence.
+
+const barcodeOverlay = $("#barcode-overlay");
+const barcodeVideo   = $("#barcode-video");
+const barcodeStatus  = $("#barcode-status");
+const barcodeList    = $("#barcode-list");
+const barcodeDone    = $("#barcode-done");
+const barcodeManual  = $("#barcode-manual");
+const barcodeManualInput = $("#barcode-manual-input");
+
+let scannedIsbns = [];      // ISBN-13 strings, in scan order
+let barcodeControls = null; // ZXing scanner controls (call .stop())
+let lastFlash = null;
+
+/** True if a 13-digit string has a valid EAN-13 check digit. */
+function isValidIsbn13(s) {
+  if (!/^\d{13}$/.test(s)) return false;
+  const sum = [...s.slice(0, 12)].reduce((acc, d, i) => acc + Number(d) * (i % 2 ? 3 : 1), 0);
+  return (10 - (sum % 10)) % 10 === Number(s[12]);
+}
+
+/** Normalize typed or scanned input to a book ISBN-13, or null. Accepts ISBN-10 too. */
+function toIsbn13(input) {
+  const s = String(input || "").toUpperCase().replace(/[^0-9X]/g, "");
+  if (s.length === 13) return /^97[89]/.test(s) && isValidIsbn13(s) ? s : null;
+  if (s.length === 10 && /^\d{9}[\dX]$/.test(s)) {
+    const sum10 = [...s].reduce((acc, c, i) => acc + (c === "X" ? 10 : Number(c)) * (10 - i), 0);
+    if (sum10 % 11 !== 0) return null;
+    const base = "978" + s.slice(0, 9);
+    const sum = [...base].reduce((acc, d, i) => acc + Number(d) * (i % 2 ? 3 : 1), 0);
+    return base + ((10 - (sum % 10)) % 10);
+  }
+  return null;
+}
+
+function setBarcodeStatus(msg) { barcodeStatus.textContent = msg; }
+
+function renderScannedIsbns() {
+  barcodeList.innerHTML = scannedIsbns
+    .map((isbn, i) => `<li><span>${escHtml(isbn)}</span><button type="button" class="btn btn-danger btn-sm" data-i="${i}" aria-label="Remove ${escHtml(isbn)}">✕</button></li>`)
+    .join("");
+  barcodeDone.disabled = scannedIsbns.length === 0;
+  barcodeDone.textContent = scannedIsbns.length ? `Done — add ${scannedIsbns.length} book${scannedIsbns.length === 1 ? "" : "s"}` : "Done";
+}
+
+barcodeList.addEventListener("click", (e) => {
+  const btn = e.target.closest("button[data-i]");
+  if (!btn) return;
+  scannedIsbns.splice(+btn.dataset.i, 1);
+  renderScannedIsbns();
+});
+
+/** Add an ISBN (from the camera or typed). Returns true if it was new. */
+function addScannedIsbn(raw, { fromCamera = false } = {}) {
+  const isbn = toIsbn13(raw);
+  if (!isbn) {
+    if (!fromCamera) setBarcodeStatus(`"${raw}" isn't a valid book ISBN — check the digits.`);
+    return false; // the camera also sees non-book barcodes (prices, UPCs): ignore quietly
+  }
+  if (scannedIsbns.includes(isbn) || identifiedBooks.some((b) => b.isbn13 === isbn)) {
+    if (!fromCamera || lastFlash !== isbn) setBarcodeStatus(`Already added ${isbn}.`);
+    lastFlash = isbn;
+    return false;
+  }
+  scannedIsbns.push(isbn);
+  lastFlash = isbn;
+  renderScannedIsbns();
+  setBarcodeStatus(`✅ Added ${isbn} — point at the next barcode.`);
+  barcodeOverlay.classList.remove("flash");
+  void barcodeOverlay.offsetWidth; // restart the flash animation
+  barcodeOverlay.classList.add("flash");
+  if (navigator.vibrate) navigator.vibrate(80);
+  return true;
+}
+
+async function startBarcodeCamera() {
+  if (!window.ZXingBrowser) {
+    setBarcodeStatus("The barcode reader didn't load (check your connection). You can still type ISBNs below.");
+    return;
+  }
+  if (!navigator.mediaDevices?.getUserMedia) {
+    setBarcodeStatus("This browser can't use the camera here (it needs HTTPS). You can type ISBNs below.");
+    return;
+  }
+  try {
+    const hints = new Map([[ZXingBrowser.DecodeHintType?.POSSIBLE_FORMATS ?? 2, [ZXingBrowser.BarcodeFormat?.EAN_13 ?? 7]]]);
+    const reader = new ZXingBrowser.BrowserMultiFormatReader(hints, { delayBetweenScanAttempts: 150 });
+    barcodeControls = await reader.decodeFromConstraints(
+      { video: { facingMode: "environment" } },
+      barcodeVideo,
+      (result) => { if (result) addScannedIsbn(result.getText(), { fromCamera: true }); }
+    );
+    // Don't overwrite an "✅ Added …" message if a barcode was read during start-up
+    if (!scannedIsbns.length) setBarcodeStatus("Point the camera at a book's barcode (on the back cover).");
+  } catch (err) {
+    console.warn("Barcode camera failed:", err);
+    setBarcodeStatus(err?.name === "NotAllowedError"
+      ? "Camera permission was denied. Allow camera access in your browser settings, or type ISBNs below."
+      : "Couldn't start the camera. You can type ISBNs below.");
+  }
+}
+
+function stopBarcodeCamera() {
+  try { barcodeControls?.stop(); } catch { /* already stopped */ }
+  barcodeControls = null;
+}
+
+function openBarcodeScanner() {
+  scannedIsbns = [];
+  lastFlash = null;
+  renderScannedIsbns();
+  barcodeManualInput.value = "";
+  setBarcodeStatus("Starting camera…");
+  barcodeOverlay.classList.remove("hidden");
+  startBarcodeCamera();
+}
+
+function closeBarcodeScanner() {
+  stopBarcodeCamera();
+  barcodeOverlay.classList.add("hidden");
+}
+
+barcodeManual.addEventListener("submit", (e) => {
+  e.preventDefault();
+  if (addScannedIsbn(barcodeManualInput.value)) barcodeManualInput.value = "";
+  barcodeManualInput.focus();
+});
+
+$("#barcode-cancel").addEventListener("click", closeBarcodeScanner);
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !barcodeOverlay.classList.contains("hidden")) closeBarcodeScanner();
+});
+
+barcodeDone.addEventListener("click", async () => {
+  const isbns = scannedIsbns.slice();
+  closeBarcodeScanner();
+  if (!isbns.length) return;
+  showLoading(`Looking up ${isbns.length} book${isbns.length === 1 ? "" : "s"} by ISBN…`);
+  try {
+    const res = await fetch("/api/lookup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ books: isbns.map((isbn13) => ({ isbn13, title: "", author: "", source: "barcode" })) }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error);
+    const added = data.books.map((b, i) => ({ ...b, isbn13: b.isbn13 || isbns[i], source: "barcode", confidence: 100 }));
+    identifiedBooks = identifiedBooks.concat(added);
+    const unreachable = added.filter((b) => !b.matched && b.lookupFailed).length;
+    const missing = added.filter((b) => !b.matched && !b.lookupFailed).length;
+    renderReviewList();
+    setStep(2);
+    showStep(stepReview);
+    const notes = [];
+    if (missing) notes.push(`${missing} ISBN(s) weren't found in Open Library or Google Books.`);
+    if (unreachable) notes.push(`${unreachable} ISBN(s) couldn't be looked up right now (the book catalogs didn't respond) — "Look Up ISBNs" will try again.`);
+    if (notes.length) alert(notes.join("\n\n") + "\n\nThey're kept with their ISBN, so they'll still export to Libib. Type in a title if you like.");
+  } catch (err) {
+    // Keep the ISBNs anyway so nothing scanned is lost
+    identifiedBooks = identifiedBooks.concat(isbns.map((isbn13) => ({ title: "", author: "", isbn13, source: "barcode", confidence: 100, matched: false, lookupFailed: true })));
+    renderReviewList();
+    setStep(2);
+    showStep(stepReview);
+    alert("Couldn't look up the ISBNs right now (" + (err.message || "network error") + "). They've been added with their ISBN only.");
+  } finally {
+    hideLoading();
+  }
+});
+
+$("#btn-barcode").addEventListener("click", openBarcodeScanner);
+btnAddBarcode.addEventListener("click", openBarcodeScanner);
 
 // ── Start over ──────────────────────────────────────────────────────────────
 btnStartOver.addEventListener("click", () => {

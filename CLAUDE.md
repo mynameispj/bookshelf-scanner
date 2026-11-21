@@ -70,7 +70,7 @@ All passes live in `runScan()` and use OpenAI Structured Outputs (`callJson()` w
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/api/scan` | POST | Upload image → identified books (multipart form; NDJSON stream if requested) |
-| `/api/lookup` | POST | Enrich book list with ISBN & metadata (reuses scan-time catalog matches; Open Library, then Google Books) |
+| `/api/lookup` | POST | Enrich book list with ISBN & metadata. Books with an `isbn13` (barcode/typed) are looked up exactly by ISBN; others reuse scan-time catalog matches, then Open Library, then Google Books. Max 500 books, 6 at a time |
 
 ### Frontend Flow
 
@@ -80,6 +80,10 @@ Three-step wizard: **Capture** → **Review & Edit** → **Export CSV**
 - One automatic retry if the network drops before the scan response starts (never after streaming begins)
 - Review screen shows confidence as a percentage (≥80 green, 50–79 yellow, <50 red) with a "Remove all below 50%" button
 - 270s client timeout (fits within Vercel's 300s limit); books found before a timeout are kept and marked unverified
+
+### ISBN barcode scanning
+
+"🏷️ Scan ISBN Barcodes" (capture step) and "Add by Barcode" (review step) open a camera overlay that reads EAN-13 barcodes with **ZXing** (`@zxing/browser@0.2.1` UMD from jsDelivr, pinned with an SRI `integrity` hash — the only third-party script; update the hash if you bump the version). Only valid ISBN-13s starting 978/979 are accepted (other barcodes such as prices are ignored); ISBNs can also be typed (ISBN-10 is converted). On Done, ISBNs go to `/api/lookup` → `lookupByIsbn()` (Open Library, one retry, then Google Books) and are added to the review list as `source: "barcode"` at 100% confidence. The scanned ISBN is always kept, even when unmatched, so it still exports to Libib; `lookupFailed: true` means the catalogs didn't respond (not "not found"). The camera needs HTTPS (or localhost).
 
 ## Key Conventions
 
@@ -108,4 +112,5 @@ No dev dependencies.
 - **API key whitespace:** Key is trimmed on load to prevent trailing newline issues
 - **Slow catalogs:** Open Library searches often take 2–3 s; the catalog pass is time-boxed so it can't push a scan past Vercel's limit
 - **Local testing behind a proxy:** Node's built-in `fetch` ignores `HTTPS_PROXY`; run with `NODE_USE_ENV_PROXY=1` (Node ≥ 22.21) if catalog requests fail with `fetch failed`
+- **`.hidden` on buttons:** `.btn` sets `display`, so buttons need `.btn.hidden` (in style.css) to actually hide
 - **Unreadable formats (e.g. HEIC):** `/api/scan` checks the image decodes with sharp before streaming and returns 415 with instructions
