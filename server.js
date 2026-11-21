@@ -687,8 +687,13 @@ async function runScan(imageBuffer, mimeType, emit, signal) {
 
   // ── Pass 4: Visual confirmation – remove hallucinated books ──
   emit({ type: "stage", stage: "visual", message: "Double-checking every book against the photo…" });
-  const books = (await visuallyVerifyBooks(pass3Books, fullUri, signal))
+  const verifiedBooks = (await visuallyVerifyBooks(pass3Books, fullUri, signal))
     .map((b) => ({ ...b, confidence: toConfidence(b.confidence) }));
+
+  // ── Pass 5: Catalog check – Open Library + Google Books ──
+  emit({ type: "stage", stage: "catalog", message: "Checking books against Open Library & Google Books…" });
+  const books = await catalogCheck(verifiedBooks, signal);
+  if (signal.aborted) throw new Error("Scan aborted");
 
   console.log(`  Final → ${books.length} book(s) after all passes`);
   return { books, overview };
@@ -732,32 +737,160 @@ function isSummaryKnockoff(resultTitle, queryTitle) {
   return false;
 }
 
-/** Search Open Library with a query string, return top N docs */
-async function searchOpenLibrary(query, limit = 5) {
-  const encoded = encodeURIComponent(query);
-  const url = `https://openlibrary.org/search.json?q=${encoded}&limit=${limit}&fields=title,author_name,isbn,cover_i,first_publish_year,publisher,number_of_pages_median,subject`;
-  try {
-    const resp = await fetch(url);
-    if (!resp.ok) return [];
-    const data = await resp.json();
-    return data.docs || [];
-  } catch {
-    return [];
-  }
+const OL_FIELDS = "title,author_name,isbn,cover_i,first_publish_year,publisher,number_of_pages_median,subject";
+const CATALOG_TIMEOUT_MS = 8000;          // per request (Open Library often takes 2–3 s)
+const CATALOG_PASS_BUDGET_MS = 25000;     // whole catalog pass; unchecked books stay "unknown"
+const CATALOG_CONCURRENCY = 4;            // books looked up at once (be gentle on Open Library)
+
+/** Fetch JSON, throwing on network errors, timeouts and non-2xx responses. */
+async function fetchJson(url, signal) {
+  const timeout = AbortSignal.timeout(CATALOG_TIMEOUT_MS);
+  const resp = await fetch(url, { signal: signal ? AbortSignal.any([signal, timeout]) : timeout });
+  if (!resp.ok) throw new Error(`HTTP ${resp.status} from ${new URL(url).host}`);
+  return resp.json();
 }
 
-/** Search Open Library specifically by title field */
-async function searchOpenLibraryByTitle(title, limit = 5) {
-  const encoded = encodeURIComponent(title);
-  const url = `https://openlibrary.org/search.json?title=${encoded}&limit=${limit}&fields=title,author_name,isbn,cover_i,first_publish_year,publisher,number_of_pages_median,subject`;
-  try {
-    const resp = await fetch(url);
-    if (!resp.ok) return [];
-    const data = await resp.json();
-    return data.docs || [];
-  } catch {
-    return [];
-  }
+/** Open Library search; throws if the service can't be reached. */
+async function openLibraryDocs(param, value, limit, signal) {
+  const url = `https://openlibrary.org/search.json?${param}=${encodeURIComponent(value)}&limit=${limit}&fields=${OL_FIELDS}`;
+  return (await fetchJson(url, signal)).docs || [];
+}
+
+/** Search Open Library with a query string, return top N docs ([] on any error) */
+async function searchOpenLibrary(query, limit = 5, signal) {
+  return openLibraryDocs("q", query, limit, signal).catch(() => []);
+}
+
+/** Search Open Library specifically by title field ([] on any error) */
+async function searchOpenLibraryByTitle(title, limit = 5, signal) {
+  return openLibraryDocs("title", title, limit, signal).catch(() => []);
+}
+
+/**
+ * Search Google Books; throws if the service can't be reached or rate-limits us.
+ * Results are mapped to Open Library's doc shape so docToResult() reads both.
+ */
+async function googleBooksDocs(title, author, signal) {
+  const terms = [`intitle:"${title.replace(/"/g, "")}"`];
+  if (author && author !== "Unknown") terms.push(`inauthor:"${author.replace(/"/g, "")}"`);
+  let url = `https://www.googleapis.com/books/v1/volumes?q=${encodeURIComponent(terms.join(" "))}&maxResults=5&printType=books`;
+  const key = (process.env.GOOGLE_BOOKS_API_KEY || "").trim();
+  if (key) url += `&key=${encodeURIComponent(key)}`;
+  const data = await fetchJson(url, signal);
+  return (data.items || []).map(({ volumeInfo: v = {} }) => ({
+    title: [v.title, v.subtitle].filter(Boolean).join(": "),
+    author_name: v.authors || [],
+    isbn: (v.industryIdentifiers || [])
+      .filter((i) => i.type === "ISBN_13" || i.type === "ISBN_10")
+      .map((i) => i.identifier),
+    cover: v.imageLinks?.thumbnail?.replace(/^http:/, "https:") || null,
+    first_publish_year: (v.publishedDate || "").slice(0, 4),
+    publisher: v.publisher ? [v.publisher] : [],
+    number_of_pages_median: v.pageCount || "",
+    subject: v.categories || [],
+  }));
+}
+
+/** Pick the first catalog doc that plausibly is this book. */
+function pickMatchingDoc(docs, book) {
+  const want = normalizeTitle(book.title);
+  if (!want) return null;
+  const titleOk = (docTitle) => {
+    // Short titles ("It", "Emma") need an exact main-title match, otherwise
+    // substring matching would accept "Ithaca" for "It".
+    if (want.length < 5) return normalizeTitle((docTitle || "").split(":")[0]) === want;
+    return titlesAreSimilar(want, normalizeTitle(docTitle));
+  };
+  return docs.find((doc) =>
+    !isSummaryKnockoff(doc.title, book.title) &&
+    authorsMatch(book.author, (doc.author_name || []).join(", ")) &&
+    titleOk(doc.title)
+  ) || null;
+}
+
+/**
+ * Look one book up in Open Library and Google Books in parallel.
+ * Each source is { doc } on a match, { doc: null } on no match, or
+ * { error } when the service couldn't be reached.
+ */
+async function findCatalogMatch(book, signal) {
+  const openLibrary = (async () => {
+    const query = `${book.title} ${book.author !== "Unknown" ? book.author : ""}`.trim();
+    let doc = pickMatchingDoc(await openLibraryDocs("q", query, 5, signal), book);
+    if (!doc) doc = pickMatchingDoc(await openLibraryDocs("title", book.title, 5, signal), book);
+    return { doc };
+  })().catch((error) => ({ error }));
+  const googleBooks = googleBooksDocs(book.title, book.author, signal)
+    .then((docs) => ({ doc: pickMatchingDoc(docs, book) }))
+    .catch((error) => ({ error }));
+  const [ol, gb] = await Promise.all([openLibrary, googleBooks]);
+  return { openLibrary: ol, googleBooks: gb };
+}
+
+/** Identifies the title/author a catalog match was made for (edits invalidate it). */
+function catalogKey(book) {
+  return `${normalizeTitle(book.title)}|${(book.author || "").toLowerCase().trim()}`;
+}
+
+/** Run fn over items with at most `limit` in flight; keeps input order. */
+async function mapWithLimit(items, limit, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i], i);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
+/**
+ * Pass 5 – check every book against Open Library and Google Books.
+ * Matches raise confidence and carry ISBN/cover data forward for /api/lookup;
+ * books found in neither catalog lose confidence and get flagged. A catalog
+ * that couldn't be reached counts as "unknown", never as "not found".
+ */
+async function catalogCheck(books, parentSignal) {
+  const budget = AbortSignal.timeout(CATALOG_PASS_BUDGET_MS);
+  const signal = parentSignal ? AbortSignal.any([parentSignal, budget]) : budget;
+  let warned = false;
+  const checked = await mapWithLimit(books, CATALOG_CONCURRENCY, async (book) => {
+    if (signal.aborted) return { ...book, catalog: null, notInCatalog: false, catalogMatch: null };
+    const { openLibrary, googleBooks } = await findCatalogMatch(book, signal);
+    const sources = [openLibrary, googleBooks];
+    const answered = sources.filter((s) => !s.error);
+    const matched = answered.filter((s) => s.doc);
+    if (!warned && sources.some((s) => s.error)) {
+      warned = true;
+      console.warn("  Pass 5 (catalog) – a catalog was unreachable:",
+        sources.filter((s) => s.error).map((s) => s.error.message).join("; "));
+    }
+
+    const out = { ...book, catalog: null, notInCatalog: false, catalogMatch: null };
+    if (answered.length === 0) return out; // both catalogs unreachable: leave as-is
+
+    out.catalog = {
+      openLibrary: openLibrary.error ? null : !!openLibrary.doc,
+      googleBooks: googleBooks.error ? null : !!googleBooks.doc,
+    };
+    const bestDoc = openLibrary.doc || googleBooks.doc;
+    if (bestDoc) out.catalogMatch = { ...docToResult(bestDoc, book), matchedFor: catalogKey(book) };
+
+    const conf = toConfidence(book.confidence);
+    if (matched.length === 2) out.confidence = toConfidence(conf + 15);
+    else if (matched.length === 1) out.confidence = toConfidence(conf + 5);
+    else {
+      out.confidence = toConfidence(conf - 25);
+      out.notInCatalog = true;
+    }
+    return out;
+  });
+  const found = checked.filter((b) => b.catalogMatch).length;
+  const missing = checked.filter((b) => b.notInCatalog).length;
+  console.log(`  Pass 5 (catalog) → ${found} found, ${missing} not in any catalog`);
+  return checked;
 }
 
 /** Build an enriched book result from an Open Library doc */
@@ -765,7 +898,7 @@ function docToResult(doc, originalBook) {
   const isbn13 = (doc.isbn || []).find((i) => i.length === 13) || "";
   const isbn10 = (doc.isbn || []).find((i) => i.length === 10) || "";
   const coverId = doc.cover_i;
-  const coverUrl = coverId ? `https://covers.openlibrary.org/b/id/${coverId}-M.jpg` : null;
+  const coverUrl = coverId ? `https://covers.openlibrary.org/b/id/${coverId}-M.jpg` : (doc.cover || null);
   return {
     title: doc.title || originalBook.title,
     author: (doc.author_name || []).join(", ") || originalBook.author,
@@ -780,8 +913,18 @@ function docToResult(doc, originalBook) {
   };
 }
 
-/** Find the best Open Library match for a book, using cascading search */
+/**
+ * Find the best catalog match for a book. Reuses the match from the scan's
+ * catalog pass when the title/author haven't been edited since; otherwise
+ * tries Open Library strategies, then Google Books.
+ */
 async function lookupOneBook(book) {
+  const cached = book.catalogMatch;
+  if (cached?.matched && cached.matchedFor === catalogKey(book)) {
+    const { matchedFor: _k, ...result } = cached;
+    return result;
+  }
+
   const strategies = [
     // Strategy 1: title + author (general search)
     { query: () => `${book.title} ${book.author !== "Unknown" ? book.author : ""}`.trim(), useAuthorFilter: true },
@@ -829,8 +972,17 @@ async function lookupOneBook(book) {
     }
   }
 
+  // Open Library had nothing — try Google Books before giving up
+  try {
+    const doc = pickMatchingDoc(await googleBooksDocs(book.title, book.author), book);
+    if (doc) return docToResult(doc, book);
+  } catch {
+    // Google Books unreachable or rate-limited
+  }
+
   // No match found with any strategy
-  return { ...book, matched: false };
+  const { catalogMatch: _m, ...rest } = book;
+  return { ...rest, matched: false };
 }
 
 app.post("/api/lookup", async (req, res) => {

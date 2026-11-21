@@ -281,6 +281,11 @@ function renderReviewList({ pending = false } = {}) {
     const confLabel = `${conf === "high" ? "✅" : conf === "medium" ? "🟡" : "🔴"} ${pct}%`;
     const correctedTag = book.corrected ? ' <span class="corrected-tag">✏️ auto-corrected</span>' : '';
     const unverifiedTag = book.unverified ? ' <span class="corrected-tag">⚠ unverified</span>' : '';
+    const catalogTag = book.catalogMatch
+      ? ' <span class="corrected-tag catalog-found">📚 In catalog</span>'
+      : book.notInCatalog
+        ? ' <span class="corrected-tag catalog-missing">⚠ Not in any catalog — double-check</span>'
+        : '';
     const dis = pending ? "disabled" : "";
     const card = document.createElement("div");
     card.className = `book-card confidence-${conf}${pending ? " pending" : ""}`;
@@ -288,7 +293,7 @@ function renderReviewList({ pending = false } = {}) {
       <div class="info">
         <input type="text" data-idx="${i}" data-field="title" value="${esc(book.title)}" placeholder="Title" ${dis} />
         <input type="text" data-idx="${i}" data-field="author" value="${esc(book.author)}" placeholder="Author" ${dis} />
-        <span class="meta conf-badge conf-${conf}">${confLabel} confidence${correctedTag}${unverifiedTag}</span>
+        <span class="meta conf-badge conf-${conf}">${confLabel} confidence${correctedTag}${unverifiedTag}${catalogTag}</span>
       </div>
       ${pending ? "" : `<button class="btn btn-danger remove" data-idx="${i}">✕</button>`}
     `;
