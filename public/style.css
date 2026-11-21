@@ -220,6 +220,10 @@ main {
   .book-card.pending, .spinner-sm { animation: none; }
 }
 .btn:disabled { opacity: .5; cursor: not-allowed; }
+
+/* ── Catalog check tags ── */
+.corrected-tag.catalog-found   { color: #15803d; }
+.corrected-tag.catalog-missing { color: #b45309; }
 #loading-text { margin-top: 1rem; font-weight: 600; color: var(--clr-muted); }
 
 /* ── Footer ─────────────────────────────────────────────── */

@@ -41,6 +41,7 @@ No build step, no test suite, no linter configured.
 |----------|----------|-------------|
 | `OPENAI_API_KEY` | Yes | OpenAI API key for GPT-4o Vision |
 | `PORT` | No | Server port (defaults to 3000) |
+| `GOOGLE_BOOKS_API_KEY` | No | Google Books key for the catalog check; without it Google Books is often rate-limited (treated as "unknown") |
 
 Copy `.env.example` to `.env` and fill in values.
 
@@ -54,9 +55,10 @@ All passes live in `runScan()` and use OpenAI Structured Outputs (`callJson()` w
 
 1. **Pass 1 — Count:** Quick GPT-4o call to estimate book count and shelf layout
 2. **Pass 2 — Identify:** Adaptive image tiling (2-4 cols, 2-4 rows) with 25% overlap, plus one full-image pass; parallel GPT-4o "high" detail calls via `Promise.allSettled` (a failed section is skipped, not fatal)
-3. **Deduplication:** Merge results across overlapping tiles, keep highest confidence
+3. **Deduplication:** Merge results across overlapping tiles, keep highest confidence (confidence is an integer 0–100; `toConfidence()` clamps it and maps legacy high/medium/low labels)
 4. **Pass 3 — Verify:** Text-only GPT call to fix title/author mix-ups
 5. **Pass 4 — Visual verify:** Re-show the full image with the list; drop books GPT can't find on the shelf
+6. **Pass 5 — Catalog check:** `catalogCheck()` looks each book up in Open Library and Google Books in parallel (4 books at a time, 8 s per request, 25 s for the whole pass). Found in both → +15 confidence, one → +5, neither → −25 and `notInCatalog: true`. A catalog that times out or rate-limits counts as unknown, never "not found". Matches are stored in `book.catalogMatch` (with `matchedFor`), which `/api/lookup` reuses if the title/author weren't edited
 
 ### Streaming scan results
 
@@ -68,13 +70,15 @@ All passes live in `runScan()` and use OpenAI Structured Outputs (`callJson()` w
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/api/scan` | POST | Upload image → identified books (multipart form; NDJSON stream if requested) |
-| `/api/lookup` | POST | Enrich book list with ISBN & metadata from Open Library |
+| `/api/lookup` | POST | Enrich book list with ISBN & metadata (reuses scan-time catalog matches; Open Library, then Google Books) |
 
 ### Frontend Flow
 
 Three-step wizard: **Capture** → **Review & Edit** → **Export CSV**
 
-- Client-side image compression before upload (max 3200px, JPEG quality 0.80)
+- Client-side image compression before upload (max 3200px, JPEG quality 0.80); small JPEG/PNGs are sent as-is, and the original is kept if compressing makes it bigger
+- One automatic retry if the network drops before the scan response starts (never after streaming begins)
+- Review screen shows confidence as a percentage (≥80 green, 50–79 yellow, <50 red) with a "Remove all below 50%" button
 - 270s client timeout (fits within Vercel's 300s limit); books found before a timeout are kept and marked unverified
 
 ## Key Conventions
@@ -102,3 +106,6 @@ No dev dependencies.
 - **Hallucinated books:** Multi-pass verification pipeline reduces false positives
 - **Undercounting:** Adaptive tiling with overlap ensures books at tile edges aren't missed
 - **API key whitespace:** Key is trimmed on load to prevent trailing newline issues
+- **Slow catalogs:** Open Library searches often take 2–3 s; the catalog pass is time-boxed so it can't push a scan past Vercel's limit
+- **Local testing behind a proxy:** Node's built-in `fetch` ignores `HTTPS_PROXY`; run with `NODE_USE_ENV_PROXY=1` (Node ≥ 22.21) if catalog requests fail with `fetch failed`
+- **Unreadable formats (e.g. HEIC):** `/api/scan` checks the image decodes with sharp before streaming and returns 415 with instructions

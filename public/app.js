@@ -19,6 +19,7 @@ const btnScan     = $("#btn-scan");
 const bookList    = $("#book-list");
 const reviewHint  = $("#review-hint");
 const btnAddManual = $("#btn-add-manual");
+const btnRemoveLow = $("#btn-remove-low");
 const btnLookup   = $("#btn-lookup");
 const enrichedList = $("#enriched-list");
 const btnDownload  = $("#btn-download-csv");
@@ -43,14 +44,23 @@ function setStep(n) {
  * Compress an image file to stay under Vercel's 4.5 MB body limit.
  * Resizes to max 3200px on longest side and uses JPEG quality 0.80.
  * This preserves enough spine-text detail for GPT while keeping size ~2-3 MB.
- * Returns a Blob ready for FormData.
+ * Skips re-encoding photos that are already small, and never returns a file
+ * bigger than the original. Rejects if the browser can't decode the image
+ * (e.g. HEIC on desktop) — the caller then uploads the original.
  */
 function compressImage(file, maxDim = 3200, quality = 0.80) {
   return new Promise((resolve, reject) => {
     const img = new Image();
+    const url = URL.createObjectURL(file);
     img.onload = () => {
-      let { width, height } = img;
-      if (width > maxDim || height > maxDim) {
+      URL.revokeObjectURL(url);
+      let { naturalWidth: width, naturalHeight: height } = img;
+      const fitsAlready = width <= maxDim && height <= maxDim;
+      if (fitsAlready && file.size < 2.5 * 1024 * 1024 && /jpe?g|png/i.test(file.type)) {
+        resolve(file); // small enough already — re-encoding would only lose detail
+        return;
+      }
+      if (!fitsAlready) {
         const ratio = Math.min(maxDim / width, maxDim / height);
         width  = Math.round(width * ratio);
         height = Math.round(height * ratio);
@@ -61,13 +71,19 @@ function compressImage(file, maxDim = 3200, quality = 0.80) {
       const ctx = canvas.getContext("2d");
       ctx.drawImage(img, 0, 0, width, height);
       canvas.toBlob(
-        (blob) => (blob ? resolve(blob) : reject(new Error("Canvas compression failed"))),
+        (blob) => {
+          if (!blob) return reject(new Error("Canvas compression failed"));
+          resolve(blob.size < file.size ? blob : file);
+        },
         "image/jpeg",
         quality
       );
     };
-    img.onerror = () => reject(new Error("Could not load image for compression"));
-    img.src = URL.createObjectURL(file);
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error("Could not load image for compression"));
+    };
+    img.src = url;
   });
 }
 
@@ -144,13 +160,26 @@ btnScan.addEventListener("click", async () => {
     }
   }
 
+  const postScan = () => fetch("/api/scan", {
+    method: "POST",
+    body: formData,
+    headers: { Accept: "application/x-ndjson" },
+    signal: controller.signal,
+  });
+
   try {
-    const res = await fetch("/api/scan", {
-      method: "POST",
-      body: formData,
-      headers: { Accept: "application/x-ndjson" },
-      signal: controller.signal,
-    });
+    let res;
+    try {
+      res = await postScan();
+    } catch (netErr) {
+      // One automatic retry if the network dropped before the server answered.
+      // (Never retry once results have started streaming — that would pay for the scan twice.)
+      if (!(netErr instanceof TypeError)) throw netErr;
+      console.warn("Network error starting scan, retrying once:", netErr);
+      showLoading("Connection hiccup — retrying…");
+      await new Promise((r) => setTimeout(r, 1500));
+      res = await postScan();
+    }
 
     const contentType = res.headers.get("content-type") || "";
     if (contentType.includes("application/x-ndjson")) {
@@ -164,6 +193,7 @@ btnScan.addEventListener("click", async () => {
       // Non-JSON error responses (e.g. Vercel HTML error pages)
       const text = await res.text();
       if (res.status === 413) throw new Error("Image too large. Please use a smaller photo.");
+      if (res.status === 415) throw new Error("Couldn't read this image format — please upload a JPEG or PNG.");
       if (res.status >= 500) throw new Error(`Server error (${res.status}). Please try again in a moment.`);
       throw new Error(`Unexpected response (${res.status}): ${text.slice(0, 120)}`);
     }
@@ -225,14 +255,17 @@ function renderScanProgress(p) {
 // ── Step 2: Review list ─────────────────────────────────────────────────────
 // pending = scan still running: show books read-only and disable actions.
 function renderReviewList({ pending = false } = {}) {
-  const lowCount  = identifiedBooks.filter(b => b.confidence === "low").length;
+  const lowCount  = identifiedBooks.filter(b => confPercent(b.confidence) < LOW_CONFIDENCE).length;
   let hint = `Found ${identifiedBooks.length} book(s)`;
   if (pending) hint += " so far — still scanning. You can edit once it's done.";
-  else if (lowCount > 0) hint += `. ${lowCount} flagged low-confidence — please double-check those.`;
+  else if (lowCount > 0) hint += `. ${lowCount} below ${LOW_CONFIDENCE}% confidence — please double-check those.`;
   else hint += ". Edit titles/authors or remove mistakes.";
   reviewHint.textContent = hint;
   btnLookup.disabled = pending;
   btnAddManual.disabled = pending;
+  btnRemoveLow.disabled = pending;
+  btnRemoveLow.classList.toggle("hidden", pending || lowCount === 0);
+  btnRemoveLow.textContent = `🗑 Remove ${lowCount} below ${LOW_CONFIDENCE}%`;
   bookList.innerHTML = "";
 
   if (identifiedBooks.length === 0) {
@@ -243,10 +276,16 @@ function renderReviewList({ pending = false } = {}) {
   }
 
   identifiedBooks.forEach((book, i) => {
-    const conf = book.confidence || "high";
-    const confLabel = conf === "high" ? "✅ High" : conf === "medium" ? "🟡 Medium" : "🔴 Low";
+    const pct = confPercent(book.confidence);
+    const conf = confBand(pct);
+    const confLabel = `${conf === "high" ? "✅" : conf === "medium" ? "🟡" : "🔴"} ${pct}%`;
     const correctedTag = book.corrected ? ' <span class="corrected-tag">✏️ auto-corrected</span>' : '';
     const unverifiedTag = book.unverified ? ' <span class="corrected-tag">⚠ unverified</span>' : '';
+    const catalogTag = book.catalogMatch
+      ? ' <span class="corrected-tag catalog-found">📚 In catalog</span>'
+      : book.notInCatalog
+        ? ' <span class="corrected-tag catalog-missing">⚠ Not in any catalog — double-check</span>'
+        : '';
     const dis = pending ? "disabled" : "";
     const card = document.createElement("div");
     card.className = `book-card confidence-${conf}${pending ? " pending" : ""}`;
@@ -254,7 +293,7 @@ function renderReviewList({ pending = false } = {}) {
       <div class="info">
         <input type="text" data-idx="${i}" data-field="title" value="${esc(book.title)}" placeholder="Title" ${dis} />
         <input type="text" data-idx="${i}" data-field="author" value="${esc(book.author)}" placeholder="Author" ${dis} />
-        <span class="meta conf-badge conf-${conf}">${confLabel} confidence${correctedTag}${unverifiedTag}</span>
+        <span class="meta conf-badge conf-${conf}">${confLabel} confidence${correctedTag}${unverifiedTag}${catalogTag}</span>
       </div>
       ${pending ? "" : `<button class="btn btn-danger remove" data-idx="${i}">✕</button>`}
     `;
@@ -279,6 +318,14 @@ function renderReviewList({ pending = false } = {}) {
   });
 }
 
+// Confidence is a 0–100 score from the server. Bands drive the card colours.
+const LOW_CONFIDENCE = 50;
+function confPercent(c) {
+  if (typeof c === "number" && Number.isFinite(c)) return Math.max(0, Math.min(100, Math.round(c)));
+  return { high: 90, medium: 65, low: 35 }[c] ?? 100; // legacy labels; manual books = 100
+}
+function confBand(pct) { return pct >= 80 ? "high" : pct >= LOW_CONFIDENCE ? "medium" : "low"; }
+
 function esc(s) { return (s || "").replace(/"/g, "&quot;"); }
 function escHtml(s) {
   return String(s || "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
@@ -286,11 +333,20 @@ function escHtml(s) {
 
 // Add manual book
 btnAddManual.addEventListener("click", () => {
-  identifiedBooks.push({ title: "", author: "" });
+  identifiedBooks.push({ title: "", author: "", confidence: 100 });
   renderReviewList();
   // Focus the last title input
   const inputs = bookList.querySelectorAll('input[data-field="title"]');
   if (inputs.length) inputs[inputs.length - 1].focus();
+});
+
+// Remove every book below the low-confidence threshold in one go
+btnRemoveLow.addEventListener("click", () => {
+  const low = identifiedBooks.filter(b => confPercent(b.confidence) < LOW_CONFIDENCE);
+  if (!low.length) return;
+  if (!confirm(`Remove ${low.length} book(s) below ${LOW_CONFIDENCE}% confidence?`)) return;
+  identifiedBooks = identifiedBooks.filter(b => confPercent(b.confidence) >= LOW_CONFIDENCE);
+  renderReviewList();
 });
 
 // ── Step 2 → 3: Look up metadata ───────────────────────────────────────────

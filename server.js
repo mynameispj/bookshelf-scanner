@@ -150,7 +150,7 @@ function parseGptJson(raw) {
 const BOOK_PROPS = {
   title:      { type: "string" },
   author:     { type: "string" },
-  confidence: { type: "string", enum: ["high", "medium", "low"] },
+  confidence: { type: "integer" }, // 0–100, clamped server-side by toConfidence()
 };
 
 function booksSchema(extraProps = {}) {
@@ -274,10 +274,10 @@ Scan methodically: shelf by shelf, left to right, top to bottom. Do NOT stop ear
 For each book return:
   - title       (string – the book's title ONLY, no author names)
   - author      (string – the author's name ONLY, "Unknown" if unreadable)
-  - confidence  ("high" | "medium" | "low")
-    • "high"   = text clearly readable
-    • "medium" = partially readable, you're fairly sure
-    • "low"    = guessing from color/shape/partial letters
+  - confidence  (integer 0–100: how sure you are this title AND author are correct)
+    • 80–100 = text clearly readable
+    • 50–79  = partially readable, you're fairly sure
+    • 0–49   = guessing from color/shape/partial letters
 
 TEXT ORIENTATION — books appear in many orientations:
 - Spines run vertically (text reads bottom-to-top or top-to-bottom).
@@ -296,7 +296,7 @@ TITLE vs AUTHOR — how to tell them apart on a spine:
 CRITICAL RULES — READ CAREFULLY:
 - Only report a book if you can actually see its spine or cover in THIS image. Never invent or guess books.
 - Include every book you can genuinely see, even if it means returning 20+ entries.
-- Do NOT skip books just because the text is hard to read — include them with "low" confidence.
+- Do NOT skip books just because the text is hard to read — include them with a low confidence (below 50).
 - Scan the ENTIRE image from edge to edge before finishing. Check every stack, every upright spine, every flat cover.
 - If you can only see a partial title, include what you can see — do NOT complete it from memory.
 - If a spine is too blurry to read ANY text, skip it rather than guessing a title.
@@ -306,7 +306,7 @@ CRITICAL RULES — READ CAREFULLY:
 - When in doubt about whether something is a real book spine vs background, omit it.
 
 Return an object with a "books" array.
-Example: {"books":[{"title":"Dune","author":"Frank Herbert","confidence":"high"},{"title":"1984","author":"George Orwell","confidence":"medium"}]}
+Example: {"books":[{"title":"Dune","author":"Frank Herbert","confidence":92},{"title":"1984","author":"George Orwell","confidence":65}]}
 If no books are visible in this section, return {"books":[]}.`,
       },
       {
@@ -318,7 +318,7 @@ If no books are visible in this section, return {"books":[]}.`,
       },
     ],
   });
-  return result.books;
+  return result.books.map((b) => ({ ...b, confidence: toConfidence(b.confidence) }));
 }
 
 // ---------------------------------------------------------------------------
@@ -353,11 +353,21 @@ function titlesAreSimilar(normA, normB) {
 }
 
 /**
+ * Normalize a confidence value to an integer 0–100. Accepts numbers or the
+ * legacy "high"/"medium"/"low" labels (e.g. from older clients).
+ */
+function toConfidence(c) {
+  const legacy = { high: 90, medium: 65, low: 35 };
+  const n = typeof c === "number" ? c : legacy[String(c).toLowerCase()] ?? Number(c);
+  if (!Number.isFinite(n)) return 50;
+  return Math.max(0, Math.min(100, Math.round(n)));
+}
+
+/**
  * Merge book arrays from multiple tiles. Keep the highest-confidence copy
  * when duplicates are found (same or similar normalized title).
  */
 function deduplicateBooks(allBooks) {
-  const confRank = { high: 3, medium: 2, low: 1 };
   const results = []; // array of { normTitle, book }
 
   for (const book of allBooks) {
@@ -369,8 +379,8 @@ function deduplicateBooks(allBooks) {
     for (let i = 0; i < results.length; i++) {
       if (titlesAreSimilar(normTitle, results[i].normTitle)) {
         // Keep whichever has higher confidence; if tied, keep the one with the longer (more complete) title
-        const existingRank = confRank[results[i].book.confidence] || 0;
-        const newRank = confRank[book.confidence] || 0;
+        const existingRank = toConfidence(results[i].book.confidence);
+        const newRank = toConfidence(book.confidence);
         if (newRank > existingRank || (newRank === existingRank && book.title.length > results[i].book.title.length)) {
           results[i] = { normTitle, book };
         }
@@ -422,7 +432,7 @@ Your job is to FIX common errors:
 For each book, preserve the original confidence field. If you made a correction, set "corrected": true on that entry.
 
 Return an object with the corrected "books" array in the same format:
-{"books":[{"title":"...","author":"...","confidence":"high|medium|low","corrected":true|false}]}`,
+{"books":[{"title":"...","author":"...","confidence":0-100,"corrected":true|false}]}`,
         },
         {
           role: "user",
@@ -479,7 +489,7 @@ Do NOT over-reject: if you are genuinely unsure, lean toward visible=true.
 But hallucinated books — those with no matching spine anywhere — must be marked visible=false.
 
 Return an object with a "books" array containing EVERY book from the list, each with the same title, author, confidence and corrected values you were given, plus "visible":
-{"books":[{"title":"...","author":"...","confidence":"high|medium|low","corrected":true|false,"visible":true}]}`,
+{"books":[{"title":"...","author":"...","confidence":0-100,"corrected":true|false,"visible":true}]}`,
         },
         {
           role: "user",
@@ -527,6 +537,21 @@ app.post("/api/scan", (req, res, next) => {
 }, async (req, res) => {
   if (!req.file) return res.status(400).json({ error: "No image uploaded" });
 
+  // Reject formats we can't decode (e.g. HEIC) before streaming starts, so the
+  // client gets a normal JSON error with a helpful message.
+  let imageBuffer;
+  try {
+    imageBuffer = fs.readFileSync(req.file.path);
+    const meta = await sharp(imageBuffer).metadata();
+    if (!meta.width || !meta.height) throw new Error("no dimensions");
+  } catch {
+    fs.unlink(req.file.path, () => {});
+    return res.status(415).json({
+      error: "Couldn't read this image format — please upload a JPEG or PNG. " +
+        "On iPhone: Settings → Camera → Formats → Most Compatible.",
+    });
+  }
+
   // Clients that send `Accept: application/x-ndjson` get progress events as
   // newline-delimited JSON while the scan runs; others get one JSON response.
   const streaming = (req.headers.accept || "").includes("application/x-ndjson");
@@ -550,7 +575,6 @@ app.post("/api/scan", (req, res, next) => {
   }
 
   try {
-    const imageBuffer = fs.readFileSync(req.file.path);
     const mimeType = req.file.mimetype || "image/jpeg";
     const result = await runScan(imageBuffer, mimeType, emit, controller.signal);
 
@@ -663,7 +687,13 @@ async function runScan(imageBuffer, mimeType, emit, signal) {
 
   // ── Pass 4: Visual confirmation – remove hallucinated books ──
   emit({ type: "stage", stage: "visual", message: "Double-checking every book against the photo…" });
-  const books = await visuallyVerifyBooks(pass3Books, fullUri, signal);
+  const verifiedBooks = (await visuallyVerifyBooks(pass3Books, fullUri, signal))
+    .map((b) => ({ ...b, confidence: toConfidence(b.confidence) }));
+
+  // ── Pass 5: Catalog check – Open Library + Google Books ──
+  emit({ type: "stage", stage: "catalog", message: "Checking books against Open Library & Google Books…" });
+  const books = await catalogCheck(verifiedBooks, signal);
+  if (signal.aborted) throw new Error("Scan aborted");
 
   console.log(`  Final → ${books.length} book(s) after all passes`);
   return { books, overview };
@@ -707,32 +737,160 @@ function isSummaryKnockoff(resultTitle, queryTitle) {
   return false;
 }
 
-/** Search Open Library with a query string, return top N docs */
-async function searchOpenLibrary(query, limit = 5) {
-  const encoded = encodeURIComponent(query);
-  const url = `https://openlibrary.org/search.json?q=${encoded}&limit=${limit}&fields=title,author_name,isbn,cover_i,first_publish_year,publisher,number_of_pages_median,subject`;
-  try {
-    const resp = await fetch(url);
-    if (!resp.ok) return [];
-    const data = await resp.json();
-    return data.docs || [];
-  } catch {
-    return [];
-  }
+const OL_FIELDS = "title,author_name,isbn,cover_i,first_publish_year,publisher,number_of_pages_median,subject";
+const CATALOG_TIMEOUT_MS = 8000;          // per request (Open Library often takes 2–3 s)
+const CATALOG_PASS_BUDGET_MS = 25000;     // whole catalog pass; unchecked books stay "unknown"
+const CATALOG_CONCURRENCY = 4;            // books looked up at once (be gentle on Open Library)
+
+/** Fetch JSON, throwing on network errors, timeouts and non-2xx responses. */
+async function fetchJson(url, signal) {
+  const timeout = AbortSignal.timeout(CATALOG_TIMEOUT_MS);
+  const resp = await fetch(url, { signal: signal ? AbortSignal.any([signal, timeout]) : timeout });
+  if (!resp.ok) throw new Error(`HTTP ${resp.status} from ${new URL(url).host}`);
+  return resp.json();
 }
 
-/** Search Open Library specifically by title field */
-async function searchOpenLibraryByTitle(title, limit = 5) {
-  const encoded = encodeURIComponent(title);
-  const url = `https://openlibrary.org/search.json?title=${encoded}&limit=${limit}&fields=title,author_name,isbn,cover_i,first_publish_year,publisher,number_of_pages_median,subject`;
-  try {
-    const resp = await fetch(url);
-    if (!resp.ok) return [];
-    const data = await resp.json();
-    return data.docs || [];
-  } catch {
-    return [];
-  }
+/** Open Library search; throws if the service can't be reached. */
+async function openLibraryDocs(param, value, limit, signal) {
+  const url = `https://openlibrary.org/search.json?${param}=${encodeURIComponent(value)}&limit=${limit}&fields=${OL_FIELDS}`;
+  return (await fetchJson(url, signal)).docs || [];
+}
+
+/** Search Open Library with a query string, return top N docs ([] on any error) */
+async function searchOpenLibrary(query, limit = 5, signal) {
+  return openLibraryDocs("q", query, limit, signal).catch(() => []);
+}
+
+/** Search Open Library specifically by title field ([] on any error) */
+async function searchOpenLibraryByTitle(title, limit = 5, signal) {
+  return openLibraryDocs("title", title, limit, signal).catch(() => []);
+}
+
+/**
+ * Search Google Books; throws if the service can't be reached or rate-limits us.
+ * Results are mapped to Open Library's doc shape so docToResult() reads both.
+ */
+async function googleBooksDocs(title, author, signal) {
+  const terms = [`intitle:"${title.replace(/"/g, "")}"`];
+  if (author && author !== "Unknown") terms.push(`inauthor:"${author.replace(/"/g, "")}"`);
+  let url = `https://www.googleapis.com/books/v1/volumes?q=${encodeURIComponent(terms.join(" "))}&maxResults=5&printType=books`;
+  const key = (process.env.GOOGLE_BOOKS_API_KEY || "").trim();
+  if (key) url += `&key=${encodeURIComponent(key)}`;
+  const data = await fetchJson(url, signal);
+  return (data.items || []).map(({ volumeInfo: v = {} }) => ({
+    title: [v.title, v.subtitle].filter(Boolean).join(": "),
+    author_name: v.authors || [],
+    isbn: (v.industryIdentifiers || [])
+      .filter((i) => i.type === "ISBN_13" || i.type === "ISBN_10")
+      .map((i) => i.identifier),
+    cover: v.imageLinks?.thumbnail?.replace(/^http:/, "https:") || null,
+    first_publish_year: (v.publishedDate || "").slice(0, 4),
+    publisher: v.publisher ? [v.publisher] : [],
+    number_of_pages_median: v.pageCount || "",
+    subject: v.categories || [],
+  }));
+}
+
+/** Pick the first catalog doc that plausibly is this book. */
+function pickMatchingDoc(docs, book) {
+  const want = normalizeTitle(book.title);
+  if (!want) return null;
+  const titleOk = (docTitle) => {
+    // Short titles ("It", "Emma") need an exact main-title match, otherwise
+    // substring matching would accept "Ithaca" for "It".
+    if (want.length < 5) return normalizeTitle((docTitle || "").split(":")[0]) === want;
+    return titlesAreSimilar(want, normalizeTitle(docTitle));
+  };
+  return docs.find((doc) =>
+    !isSummaryKnockoff(doc.title, book.title) &&
+    authorsMatch(book.author, (doc.author_name || []).join(", ")) &&
+    titleOk(doc.title)
+  ) || null;
+}
+
+/**
+ * Look one book up in Open Library and Google Books in parallel.
+ * Each source is { doc } on a match, { doc: null } on no match, or
+ * { error } when the service couldn't be reached.
+ */
+async function findCatalogMatch(book, signal) {
+  const openLibrary = (async () => {
+    const query = `${book.title} ${book.author !== "Unknown" ? book.author : ""}`.trim();
+    let doc = pickMatchingDoc(await openLibraryDocs("q", query, 5, signal), book);
+    if (!doc) doc = pickMatchingDoc(await openLibraryDocs("title", book.title, 5, signal), book);
+    return { doc };
+  })().catch((error) => ({ error }));
+  const googleBooks = googleBooksDocs(book.title, book.author, signal)
+    .then((docs) => ({ doc: pickMatchingDoc(docs, book) }))
+    .catch((error) => ({ error }));
+  const [ol, gb] = await Promise.all([openLibrary, googleBooks]);
+  return { openLibrary: ol, googleBooks: gb };
+}
+
+/** Identifies the title/author a catalog match was made for (edits invalidate it). */
+function catalogKey(book) {
+  return `${normalizeTitle(book.title)}|${(book.author || "").toLowerCase().trim()}`;
+}
+
+/** Run fn over items with at most `limit` in flight; keeps input order. */
+async function mapWithLimit(items, limit, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i], i);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
+/**
+ * Pass 5 – check every book against Open Library and Google Books.
+ * Matches raise confidence and carry ISBN/cover data forward for /api/lookup;
+ * books found in neither catalog lose confidence and get flagged. A catalog
+ * that couldn't be reached counts as "unknown", never as "not found".
+ */
+async function catalogCheck(books, parentSignal) {
+  const budget = AbortSignal.timeout(CATALOG_PASS_BUDGET_MS);
+  const signal = parentSignal ? AbortSignal.any([parentSignal, budget]) : budget;
+  let warned = false;
+  const checked = await mapWithLimit(books, CATALOG_CONCURRENCY, async (book) => {
+    if (signal.aborted) return { ...book, catalog: null, notInCatalog: false, catalogMatch: null };
+    const { openLibrary, googleBooks } = await findCatalogMatch(book, signal);
+    const sources = [openLibrary, googleBooks];
+    const answered = sources.filter((s) => !s.error);
+    const matched = answered.filter((s) => s.doc);
+    if (!warned && sources.some((s) => s.error)) {
+      warned = true;
+      console.warn("  Pass 5 (catalog) – a catalog was unreachable:",
+        sources.filter((s) => s.error).map((s) => s.error.message).join("; "));
+    }
+
+    const out = { ...book, catalog: null, notInCatalog: false, catalogMatch: null };
+    if (answered.length === 0) return out; // both catalogs unreachable: leave as-is
+
+    out.catalog = {
+      openLibrary: openLibrary.error ? null : !!openLibrary.doc,
+      googleBooks: googleBooks.error ? null : !!googleBooks.doc,
+    };
+    const bestDoc = openLibrary.doc || googleBooks.doc;
+    if (bestDoc) out.catalogMatch = { ...docToResult(bestDoc, book), matchedFor: catalogKey(book) };
+
+    const conf = toConfidence(book.confidence);
+    if (matched.length === 2) out.confidence = toConfidence(conf + 15);
+    else if (matched.length === 1) out.confidence = toConfidence(conf + 5);
+    else {
+      out.confidence = toConfidence(conf - 25);
+      out.notInCatalog = true;
+    }
+    return out;
+  });
+  const found = checked.filter((b) => b.catalogMatch).length;
+  const missing = checked.filter((b) => b.notInCatalog).length;
+  console.log(`  Pass 5 (catalog) → ${found} found, ${missing} not in any catalog`);
+  return checked;
 }
 
 /** Build an enriched book result from an Open Library doc */
@@ -740,7 +898,7 @@ function docToResult(doc, originalBook) {
   const isbn13 = (doc.isbn || []).find((i) => i.length === 13) || "";
   const isbn10 = (doc.isbn || []).find((i) => i.length === 10) || "";
   const coverId = doc.cover_i;
-  const coverUrl = coverId ? `https://covers.openlibrary.org/b/id/${coverId}-M.jpg` : null;
+  const coverUrl = coverId ? `https://covers.openlibrary.org/b/id/${coverId}-M.jpg` : (doc.cover || null);
   return {
     title: doc.title || originalBook.title,
     author: (doc.author_name || []).join(", ") || originalBook.author,
@@ -755,8 +913,18 @@ function docToResult(doc, originalBook) {
   };
 }
 
-/** Find the best Open Library match for a book, using cascading search */
+/**
+ * Find the best catalog match for a book. Reuses the match from the scan's
+ * catalog pass when the title/author haven't been edited since; otherwise
+ * tries Open Library strategies, then Google Books.
+ */
 async function lookupOneBook(book) {
+  const cached = book.catalogMatch;
+  if (cached?.matched && cached.matchedFor === catalogKey(book)) {
+    const { matchedFor: _k, ...result } = cached;
+    return result;
+  }
+
   const strategies = [
     // Strategy 1: title + author (general search)
     { query: () => `${book.title} ${book.author !== "Unknown" ? book.author : ""}`.trim(), useAuthorFilter: true },
@@ -804,8 +972,17 @@ async function lookupOneBook(book) {
     }
   }
 
+  // Open Library had nothing — try Google Books before giving up
+  try {
+    const doc = pickMatchingDoc(await googleBooksDocs(book.title, book.author), book);
+    if (doc) return docToResult(doc, book);
+  } catch {
+    // Google Books unreachable or rate-limited
+  }
+
   // No match found with any strategy
-  return { ...book, matched: false };
+  const { catalogMatch: _m, ...rest } = book;
+  return { ...rest, matched: false };
 }
 
 app.post("/api/lookup", async (req, res) => {
