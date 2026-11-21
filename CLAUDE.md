@@ -54,7 +54,7 @@ All passes live in `runScan()` and use OpenAI Structured Outputs (`callJson()` w
 
 1. **Pass 1 — Count:** Quick GPT-4o call to estimate book count and shelf layout
 2. **Pass 2 — Identify:** Adaptive image tiling (2-4 cols, 2-4 rows) with 25% overlap, plus one full-image pass; parallel GPT-4o "high" detail calls via `Promise.allSettled` (a failed section is skipped, not fatal)
-3. **Deduplication:** Merge results across overlapping tiles, keep highest confidence
+3. **Deduplication:** Merge results across overlapping tiles, keep highest confidence (confidence is an integer 0–100; `toConfidence()` clamps it and maps legacy high/medium/low labels)
 4. **Pass 3 — Verify:** Text-only GPT call to fix title/author mix-ups
 5. **Pass 4 — Visual verify:** Re-show the full image with the list; drop books GPT can't find on the shelf
 
@@ -74,7 +74,9 @@ All passes live in `runScan()` and use OpenAI Structured Outputs (`callJson()` w
 
 Three-step wizard: **Capture** → **Review & Edit** → **Export CSV**
 
-- Client-side image compression before upload (max 3200px, JPEG quality 0.80)
+- Client-side image compression before upload (max 3200px, JPEG quality 0.80); small JPEG/PNGs are sent as-is, and the original is kept if compressing makes it bigger
+- One automatic retry if the network drops before the scan response starts (never after streaming begins)
+- Review screen shows confidence as a percentage (≥80 green, 50–79 yellow, <50 red) with a "Remove all below 50%" button
 - 270s client timeout (fits within Vercel's 300s limit); books found before a timeout are kept and marked unverified
 
 ## Key Conventions
@@ -102,3 +104,4 @@ No dev dependencies.
 - **Hallucinated books:** Multi-pass verification pipeline reduces false positives
 - **Undercounting:** Adaptive tiling with overlap ensures books at tile edges aren't missed
 - **API key whitespace:** Key is trimmed on load to prevent trailing newline issues
+- **Unreadable formats (e.g. HEIC):** `/api/scan` checks the image decodes with sharp before streaming and returns 415 with instructions

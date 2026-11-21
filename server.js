@@ -150,7 +150,7 @@ function parseGptJson(raw) {
 const BOOK_PROPS = {
   title:      { type: "string" },
   author:     { type: "string" },
-  confidence: { type: "string", enum: ["high", "medium", "low"] },
+  confidence: { type: "integer" }, // 0–100, clamped server-side by toConfidence()
 };
 
 function booksSchema(extraProps = {}) {
@@ -274,10 +274,10 @@ Scan methodically: shelf by shelf, left to right, top to bottom. Do NOT stop ear
 For each book return:
   - title       (string – the book's title ONLY, no author names)
   - author      (string – the author's name ONLY, "Unknown" if unreadable)
-  - confidence  ("high" | "medium" | "low")
-    • "high"   = text clearly readable
-    • "medium" = partially readable, you're fairly sure
-    • "low"    = guessing from color/shape/partial letters
+  - confidence  (integer 0–100: how sure you are this title AND author are correct)
+    • 80–100 = text clearly readable
+    • 50–79  = partially readable, you're fairly sure
+    • 0–49   = guessing from color/shape/partial letters
 
 TEXT ORIENTATION — books appear in many orientations:
 - Spines run vertically (text reads bottom-to-top or top-to-bottom).
@@ -296,7 +296,7 @@ TITLE vs AUTHOR — how to tell them apart on a spine:
 CRITICAL RULES — READ CAREFULLY:
 - Only report a book if you can actually see its spine or cover in THIS image. Never invent or guess books.
 - Include every book you can genuinely see, even if it means returning 20+ entries.
-- Do NOT skip books just because the text is hard to read — include them with "low" confidence.
+- Do NOT skip books just because the text is hard to read — include them with a low confidence (below 50).
 - Scan the ENTIRE image from edge to edge before finishing. Check every stack, every upright spine, every flat cover.
 - If you can only see a partial title, include what you can see — do NOT complete it from memory.
 - If a spine is too blurry to read ANY text, skip it rather than guessing a title.
@@ -306,7 +306,7 @@ CRITICAL RULES — READ CAREFULLY:
 - When in doubt about whether something is a real book spine vs background, omit it.
 
 Return an object with a "books" array.
-Example: {"books":[{"title":"Dune","author":"Frank Herbert","confidence":"high"},{"title":"1984","author":"George Orwell","confidence":"medium"}]}
+Example: {"books":[{"title":"Dune","author":"Frank Herbert","confidence":92},{"title":"1984","author":"George Orwell","confidence":65}]}
 If no books are visible in this section, return {"books":[]}.`,
       },
       {
@@ -318,7 +318,7 @@ If no books are visible in this section, return {"books":[]}.`,
       },
     ],
   });
-  return result.books;
+  return result.books.map((b) => ({ ...b, confidence: toConfidence(b.confidence) }));
 }
 
 // ---------------------------------------------------------------------------
@@ -353,11 +353,21 @@ function titlesAreSimilar(normA, normB) {
 }
 
 /**
+ * Normalize a confidence value to an integer 0–100. Accepts numbers or the
+ * legacy "high"/"medium"/"low" labels (e.g. from older clients).
+ */
+function toConfidence(c) {
+  const legacy = { high: 90, medium: 65, low: 35 };
+  const n = typeof c === "number" ? c : legacy[String(c).toLowerCase()] ?? Number(c);
+  if (!Number.isFinite(n)) return 50;
+  return Math.max(0, Math.min(100, Math.round(n)));
+}
+
+/**
  * Merge book arrays from multiple tiles. Keep the highest-confidence copy
  * when duplicates are found (same or similar normalized title).
  */
 function deduplicateBooks(allBooks) {
-  const confRank = { high: 3, medium: 2, low: 1 };
   const results = []; // array of { normTitle, book }
 
   for (const book of allBooks) {
@@ -369,8 +379,8 @@ function deduplicateBooks(allBooks) {
     for (let i = 0; i < results.length; i++) {
       if (titlesAreSimilar(normTitle, results[i].normTitle)) {
         // Keep whichever has higher confidence; if tied, keep the one with the longer (more complete) title
-        const existingRank = confRank[results[i].book.confidence] || 0;
-        const newRank = confRank[book.confidence] || 0;
+        const existingRank = toConfidence(results[i].book.confidence);
+        const newRank = toConfidence(book.confidence);
         if (newRank > existingRank || (newRank === existingRank && book.title.length > results[i].book.title.length)) {
           results[i] = { normTitle, book };
         }
@@ -422,7 +432,7 @@ Your job is to FIX common errors:
 For each book, preserve the original confidence field. If you made a correction, set "corrected": true on that entry.
 
 Return an object with the corrected "books" array in the same format:
-{"books":[{"title":"...","author":"...","confidence":"high|medium|low","corrected":true|false}]}`,
+{"books":[{"title":"...","author":"...","confidence":0-100,"corrected":true|false}]}`,
         },
         {
           role: "user",
@@ -479,7 +489,7 @@ Do NOT over-reject: if you are genuinely unsure, lean toward visible=true.
 But hallucinated books — those with no matching spine anywhere — must be marked visible=false.
 
 Return an object with a "books" array containing EVERY book from the list, each with the same title, author, confidence and corrected values you were given, plus "visible":
-{"books":[{"title":"...","author":"...","confidence":"high|medium|low","corrected":true|false,"visible":true}]}`,
+{"books":[{"title":"...","author":"...","confidence":0-100,"corrected":true|false,"visible":true}]}`,
         },
         {
           role: "user",
@@ -677,7 +687,8 @@ async function runScan(imageBuffer, mimeType, emit, signal) {
 
   // ── Pass 4: Visual confirmation – remove hallucinated books ──
   emit({ type: "stage", stage: "visual", message: "Double-checking every book against the photo…" });
-  const books = await visuallyVerifyBooks(pass3Books, fullUri, signal);
+  const books = (await visuallyVerifyBooks(pass3Books, fullUri, signal))
+    .map((b) => ({ ...b, confidence: toConfidence(b.confidence) }));
 
   console.log(`  Final → ${books.length} book(s) after all passes`);
   return { books, overview };
