@@ -255,7 +255,8 @@ function renderScanProgress(p) {
 
 // ── Step 2: Review list ─────────────────────────────────────────────────────
 // pending = scan still running: show books read-only and disable actions.
-function renderReviewList({ pending = false } = {}) {
+// highlight = Set of indices to flash (books just changed by a described fix).
+function renderReviewList({ pending = false, highlight = null } = {}) {
   const lowCount  = identifiedBooks.filter(b => confPercent(b.confidence) < LOW_CONFIDENCE).length;
   let hint = `Found ${identifiedBooks.length} book(s)`;
   if (pending) hint += " so far — still scanning. You can edit once it's done.";
@@ -268,6 +269,8 @@ function renderReviewList({ pending = false } = {}) {
   btnRemoveLow.disabled = pending;
   btnRemoveLow.classList.toggle("hidden", pending || lowCount === 0);
   btnRemoveLow.textContent = `🗑 Remove ${lowCount} below ${LOW_CONFIDENCE}%`;
+  fixInput.disabled = pending || fixBusy;
+  fixApply.disabled = pending || fixBusy;
   bookList.innerHTML = "";
 
   if (identifiedBooks.length === 0) {
@@ -281,7 +284,8 @@ function renderReviewList({ pending = false } = {}) {
     const pct = confPercent(book.confidence);
     const conf = confBand(pct);
     const confLabel = `${conf === "high" ? "✅" : conf === "medium" ? "🟡" : "🔴"} ${pct}%`;
-    const correctedTag = book.corrected ? ' <span class="corrected-tag">✏️ auto-corrected</span>' : '';
+    const correctedTag = book.fixed ? ' <span class="corrected-tag">✏️ fixed</span>'
+      : book.corrected ? ' <span class="corrected-tag">✏️ auto-corrected</span>' : '';
     const unverifiedTag = book.unverified ? ' <span class="corrected-tag">⚠ unverified</span>' : '';
     const catalogTag = book.catalogMatch
       ? ' <span class="corrected-tag catalog-found">📚 In catalog</span>'
@@ -296,8 +300,9 @@ function renderReviewList({ pending = false } = {}) {
           : ' <span class="corrected-tag catalog-missing">⚠ not found in catalogs — add title</span>'}</span>`
       : `<span class="meta conf-badge conf-${conf}">${confLabel} confidence${correctedTag}${unverifiedTag}${catalogTag}</span>`;
     const card = document.createElement("div");
-    card.className = `book-card confidence-${conf}${pending ? " pending" : ""}`;
+    card.className = `book-card confidence-${conf}${pending ? " pending" : ""}${highlight?.has(i) ? " just-changed" : ""}`;
     card.innerHTML = `
+      <span class="book-num" aria-label="Book ${i + 1}">${i + 1}</span>
       <div class="info">
         <input type="text" data-idx="${i}" data-field="title" value="${esc(book.title)}" placeholder="Title" ${dis} />
         <input type="text" data-idx="${i}" data-field="author" value="${esc(book.author)}" placeholder="Author" ${dis} />
@@ -451,6 +456,76 @@ btnDownload.addEventListener("click", () => {
   a.download = `bookshelf-libib-${Date.now()}.csv`;
   a.click();
   URL.revokeObjectURL(url);
+});
+
+// ── Fix it by describing it ─────────────────────────────────────────────────
+// The user types a correction in plain words ("book 3 is by Le Guin", "remove
+// the cookbook"); /api/fix turns it into edits on the list. One level of undo.
+
+const fixForm   = $("#fix-form");
+const fixInput  = $("#fix-input");
+const fixApply  = $("#fix-apply");
+const fixStatus = $("#fix-status");
+let fixBusy = false;
+let fixUndo = null; // snapshot of identifiedBooks before the last fix
+
+function showFixStatus(message, { undo = false, error = false } = {}) {
+  fixStatus.innerHTML = "";
+  if (!message) return;
+  const text = document.createElement("span");
+  text.textContent = message;
+  fixStatus.classList.toggle("error", error);
+  fixStatus.appendChild(text);
+  if (undo) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "btn btn-secondary btn-sm";
+    btn.textContent = "↩ Undo";
+    btn.addEventListener("click", () => {
+      if (!fixUndo) return;
+      identifiedBooks = fixUndo;
+      fixUndo = null;
+      renderReviewList();
+      showFixStatus("Undone.");
+    });
+    fixStatus.appendChild(btn);
+  }
+}
+
+fixForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const instruction = fixInput.value.trim();
+  if (!instruction || fixBusy) return;
+  fixBusy = true;
+  fixInput.disabled = fixApply.disabled = true;
+  showFixStatus("Applying…");
+  const before = identifiedBooks.map((b) => ({ ...b }));
+  try {
+    const res = await fetch("/api/fix", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ books: identifiedBooks, instruction }),
+    });
+    const ct = res.headers.get("content-type") || "";
+    const data = ct.includes("application/json") ? await res.json() : { error: `Server error (${res.status})` };
+    if (!res.ok) throw new Error(data.error || `Server error (${res.status})`);
+
+    const madeChanges = data.updated + data.removed + data.added > 0;
+    if (madeChanges) {
+      fixUndo = before;
+      identifiedBooks = data.books;
+      fixInput.value = "";
+    }
+    fixBusy = false;
+    renderReviewList({ highlight: new Set(data.changed) });
+    showFixStatus(data.reply || (madeChanges ? "Done." : "Nothing changed."), { undo: madeChanges });
+  } catch (err) {
+    fixBusy = false;
+    fixInput.disabled = fixApply.disabled = false;
+    showFixStatus("Couldn't apply that fix: " + (err.message || "network error"), { error: true });
+  } finally {
+    fixInput.focus();
+  }
 });
 
 // ── ISBN barcode scanning ───────────────────────────────────────────────────
@@ -637,6 +712,9 @@ btnStartOver.addEventListener("click", () => {
   btnScan.disabled = true;
   inputCamera.value = "";
   inputUpload.value = "";
+  fixUndo = null;
+  fixInput.value = "";
+  showFixStatus("");
   setStep(1);
   showStep(stepCapture);
 });
