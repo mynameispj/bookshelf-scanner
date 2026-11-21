@@ -70,6 +70,7 @@ All passes live in `runScan()` and use OpenAI Structured Outputs (`callJson()` w
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/api/scan` | POST | Upload image → identified books (multipart form; NDJSON stream if requested) |
+| `/api/fix` | POST | `{ books, instruction }` → apply a plain-words correction ("book 3 is by Le Guin", "remove the cookbook", "add Dune"). Returns `{ books, reply, changed, updated, removed, added }`. Instruction ≤ 500 chars, ≤ 300 books |
 | `/api/lookup` | POST | Enrich book list with ISBN & metadata. Books with an `isbn13` (barcode/typed) are looked up exactly by ISBN; others reuse scan-time catalog matches, then Open Library, then Google Books. Max 500 books, 6 at a time |
 
 ### Frontend Flow
@@ -80,6 +81,10 @@ Three-step wizard: **Capture** → **Review & Edit** → **Export CSV**
 - One automatic retry if the network drops before the scan response starts (never after streaming begins)
 - Review screen shows confidence as a percentage (≥80 green, 50–79 yellow, <50 red) with a "Remove all below 50%" button
 - 270s client timeout (fits within Vercel's 300s limit); books found before a timeout are kept and marked unverified
+
+### Fix it by describing it
+
+The review step has a "✏️ Fix it by describing it" box; review cards are numbered so users can say "book 3". `/api/fix` asks GPT (`describeFixes()`, strict `FIX_SCHEMA`) for **edits, not a rewritten list** — `{index, action: update|remove, title, author}` plus `additions` and a one-sentence `reply` — and `applyFixes()` applies them: out-of-range/duplicate indexes and no-op edits are ignored, untouched books keep every field (ISBNs, catalog data), updated/added books get `fixed: true` and confidence 100. Ambiguous requests return no edits and an explanation in `reply`. The client keeps one level of undo and highlights changed cards.
 
 ### ISBN barcode scanning
 

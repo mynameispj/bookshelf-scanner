@@ -67,6 +67,15 @@
           <p>No books detected yet. Try scanning a clearer photo, or add books manually below.</p>
         </div>
       </div>
+      <form id="fix-form" class="fix-form">
+        <label for="fix-input" class="fix-label">✏️ Fix it by describing it</label>
+        <div class="fix-row">
+          <input type="text" id="fix-input" maxlength="500" autocomplete="off"
+                 placeholder='e.g. "book 3 is by Le Guin" or "remove the cookbook"' />
+          <button type="submit" class="btn btn-secondary" id="fix-apply">Apply</button>
+        </div>
+        <p id="fix-status" class="fix-status" role="status" aria-live="polite"></p>
+      </form>
       <div class="actions">
         <button class="btn btn-secondary" id="btn-add-manual">＋ Add Book Manually</button>
         <button class="btn btn-secondary" id="btn-add-barcode">🏷️ Add by Barcode</button>

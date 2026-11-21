@@ -31,7 +31,7 @@ const openai = new OpenAI({ apiKey: (process.env.OPENAI_API_KEY || "").trim() })
 // Static files
 // ---------------------------------------------------------------------------
 app.use(express.static(path.join(__dirname, "public")));
-app.use(express.json());
+app.use(express.json({ limit: "1mb" })); // book lists carry catalog data; 100kb default is too small
 
 // ---------------------------------------------------------------------------
 // Image helpers – tiling & enhancement
@@ -1084,6 +1084,151 @@ app.post("/api/lookup", async (req, res) => {
   } catch (err) {
     console.error("Lookup error:", err);
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /api/fix  – apply a correction the user describes in plain words
+// ("book 3 is by Le Guin", "remove the cookbook", "add Dune by Frank Herbert")
+// ---------------------------------------------------------------------------
+
+// GPT returns *edits* rather than a rewritten list, so it can't silently drop
+// or change books it wasn't asked about, and fields like isbn13/source survive.
+const FIX_SCHEMA = {
+  type: "object",
+  properties: {
+    reply: { type: "string" },
+    edits: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          index:  { type: "integer" },
+          action: { type: "string", enum: ["update", "remove"] },
+          title:  { type: "string" },
+          author: { type: "string" },
+        },
+        required: ["index", "action", "title", "author"],
+        additionalProperties: false,
+      },
+    },
+    additions: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: { title: { type: "string" }, author: { type: "string" } },
+        required: ["title", "author"],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ["reply", "edits", "additions"],
+  additionalProperties: false,
+};
+
+const FIX_MAX_INSTRUCTION = 500;
+const FIX_MAX_BOOKS = 300;
+
+/** Ask GPT to turn a plain-words correction into edits on the numbered list. */
+async function describeFixes(books, instruction) {
+  const list = books.length
+    ? books.map((b, i) => `${i + 1}. "${b.title || "(no title)"}" by ${b.author || "Unknown"}`).join("\n")
+    : "(the list is empty)";
+  return callJson({
+    schemaName: "book_fixes",
+    schema: FIX_SCHEMA,
+    max_tokens: 2048,
+    messages: [
+      {
+        role: "system",
+        content: `You edit a list of books that a user is reviewing after scanning their bookshelf.
+The user describes a correction in plain words. Turn it into edits.
+
+Rules:
+- Apply ONLY what the user asked. Never touch other books.
+- Books are numbered from 1 as shown. "index" is that 1-based number.
+- The user may refer to a book by number ("book 3", "the third one"), by title, or by author ("the cookbook", "the Tolkien one"). Match it against the list.
+- action "update": give the book's full corrected title and author. Repeat any field that doesn't change exactly as it was.
+- action "remove": title and author are "".
+- "additions": books the user asks to add that aren't in the list.
+- You may use your knowledge to complete a name or title the user clearly identifies (e.g. "by Le Guin" → "Ursula K. Le Guin"), but never invent changes they didn't ask for.
+- If the request is ambiguous (several books match) or matches nothing, return no edits and no additions, and explain in "reply".
+- "reply": one short, friendly sentence saying what you changed (or why you couldn't).`,
+      },
+      {
+        role: "user",
+        content: `Book list:\n${list}\n\nCorrection: ${instruction}`,
+      },
+    ],
+  });
+}
+
+/**
+ * Apply GPT's edits to the book list. Pure function: ignores out-of-range or
+ * repeated indexes, keeps every untouched book exactly as it was, and reports
+ * which positions (in the new list) changed.
+ */
+function applyFixes(books, { edits = [], additions = [], reply = "" }) {
+  const seen = new Set();
+  const valid = edits.filter((e) => {
+    const i = e.index - 1;
+    if (!Number.isInteger(i) || i < 0 || i >= books.length || seen.has(i)) return false;
+    seen.add(i);
+    return true;
+  });
+
+  const updated = new Set();
+  const removed = new Set();
+  const next = books.map((b) => ({ ...b }));
+  for (const e of valid) {
+    const i = e.index - 1;
+    if (e.action === "remove") { removed.add(i); continue; }
+    const title = (e.title || "").trim() || next[i].title;
+    const author = (e.author || "").trim() || next[i].author;
+    if (title === next[i].title && author === next[i].author) continue; // no-op edit
+    next[i] = { ...next[i], title, author, fixed: true, confidence: 100, notInCatalog: false };
+    updated.add(i);
+  }
+
+  const kept = [];
+  const changed = [];
+  next.forEach((b, i) => {
+    if (removed.has(i)) return;
+    if (updated.has(i)) changed.push(kept.length);
+    kept.push(b);
+  });
+
+  const added = additions
+    .map((a) => ({ title: (a.title || "").trim(), author: (a.author || "").trim() || "Unknown" }))
+    .filter((a) => a.title)
+    .map((a) => ({ ...a, confidence: 100, fixed: true, source: "manual" }));
+  for (const a of added) {
+    changed.push(kept.length);
+    kept.push(a);
+  }
+
+  return { books: kept, reply, changed, updated: updated.size, removed: removed.size, added: added.length };
+}
+
+app.post("/api/fix", async (req, res) => {
+  const { books, instruction } = req.body || {};
+  if (typeof instruction !== "string" || !instruction.trim())
+    return res.status(400).json({ error: "Describe what to fix." });
+  if (instruction.length > FIX_MAX_INSTRUCTION)
+    return res.status(400).json({ error: `Please keep it under ${FIX_MAX_INSTRUCTION} characters.` });
+  if (!Array.isArray(books))
+    return res.status(400).json({ error: "books must be an array" });
+  if (books.length > FIX_MAX_BOOKS)
+    return res.status(400).json({ error: `Too many books for one fix (max ${FIX_MAX_BOOKS}).` });
+
+  try {
+    const result = await describeFixes(books, instruction.trim());
+    const applied = applyFixes(books, result);
+    console.log(`  Fix → ${applied.updated} updated, ${applied.removed} removed, ${applied.added} added`);
+    res.json(applied);
+  } catch (err) {
+    console.error("Fix error:", err?.message || err);
+    res.status(500).json({ error: scanErrorMessage(err) });
   }
 });
 
