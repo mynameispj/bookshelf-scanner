@@ -130,6 +130,18 @@
   </footer>
 
   <!-- Barcode decoding (ZXing). Loaded from a CDN, pinned with an integrity hash. -->
+  <!-- Bot protection (Vercel BotID): adds an invisible challenge to the API calls that cost money.
+       Served by server.js from the botid npm package; skips itself during local development. -->
+  <script type="module">
+    import { initBotId } from "/vendor/botid.mjs";
+    initBotId({
+      protect: [
+        { path: "/api/scan", method: "POST" },
+        { path: "/api/fix", method: "POST" },
+        { path: "/api/lookup", method: "POST" },
+      ],
+    });
+  </script>
   <script src="https://cdn.jsdelivr.net/npm/@zxing/browser@0.2.1/umd/zxing-browser.min.js"
           integrity="sha384-HRtzk9lZgkbSgvUyQrnfC/GxiXZgwaNyD7hC9wcXlsBpDhkS80ISl73juef2FRuf"
           crossorigin="anonymous" defer></script>
