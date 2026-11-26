@@ -156,11 +156,27 @@ async function rejectBots(req, res) {
 // BotID's browser script reads process.env.NODE_ENV, which only exists under a
 // bundler. Serve it with that value filled in ("development" off Vercel, where
 // BotID skips itself), so the page can load it as a plain ES module.
-const BOTID_CLIENT_JS = fs
-  .readFileSync(require.resolve("botid/client/core").replace(/index\.js$/, "index.mjs"), "utf8")
-  .replaceAll("process.env.NODE_ENV", JSON.stringify(process.env.VERCEL ? "production" : "development"));
+// The .mjs file is never require()d, so Vercel only ships it because it's
+// listed in vercel.json "includeFiles". It's read lazily so a missing file
+// breaks only this one URL, never the whole app at startup.
+let botIdClientJs = null;
+function getBotIdClientJs() {
+  if (botIdClientJs === null) {
+    try {
+      botIdClientJs = fs
+        .readFileSync(require.resolve("botid/client/core").replace(/index\.js$/, "index.mjs"), "utf8")
+        .replaceAll("process.env.NODE_ENV", JSON.stringify(process.env.VERCEL ? "production" : "development"));
+    } catch (err) {
+      console.error("BotID browser script missing from deployment — check includeFiles in vercel.json:", err.message);
+      botIdClientJs = false;
+    }
+  }
+  return botIdClientJs;
+}
 app.get("/vendor/botid.mjs", (_req, res) => {
-  res.type("application/javascript").set("Cache-Control", "public, max-age=3600").send(BOTID_CLIENT_JS);
+  const js = getBotIdClientJs();
+  if (!js) return res.status(503).type("text/plain").send("BotID script unavailable");
+  res.type("application/javascript").set("Cache-Control", "public, max-age=3600").send(js);
 });
 
 app.use(express.static(path.join(__dirname, "public")));

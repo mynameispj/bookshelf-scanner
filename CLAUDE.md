@@ -134,4 +134,5 @@ No dev dependencies.
 - **Local testing behind a proxy:** Node's built-in `fetch` ignores `HTTPS_PROXY`; run with `NODE_USE_ENV_PROXY=1` (Node ≥ 22.21) if catalog requests fail with `fetch failed`
 - **BotID says "check unavailable" in logs on Vercel:** the project needs OIDC enabled (Project → Settings → Security → "Secure backend access with OIDC federation"); until then requests are allowed
 - **`.hidden` on buttons:** `.btn` sets `display`, so buttons need `.btn.hidden` (in style.css) to actually hide
+- **Files read with `fs` from `node_modules` on Vercel:** Vercel only bundles files that code `require`s. Anything else (like BotID's `client/core/index.mjs`) must be listed in `includeFiles` in `vercel.json`, or it is missing at runtime. Read such files lazily with a fallback; a throw at startup takes the whole site down with `FUNCTION_INVOCATION_FAILED`
 - **Unreadable formats (e.g. HEIC):** `/api/scan` checks the image decodes with sharp before streaming and returns 415 with instructions
