@@ -5,7 +5,8 @@
       "src": "server.js",
       "use": "@vercel/node",
       "config": {
-        "maxDuration": 300
+        "maxDuration": 300,
+        "includeFiles": ["node_modules/botid/dist/client/core/**"]
       }
     }
   ],

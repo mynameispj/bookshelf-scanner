@@ -35,23 +35,83 @@ const openai = new OpenAI({ apiKey: (process.env.OPENAI_API_KEY || "").trim() })
 // through every function). Logged as one "scan_usage"/"fix_usage" line.
 // ---------------------------------------------------------------------------
 const usageStore = new AsyncLocalStorage();
-// Estimated USD per 1M tokens (gpt-4o list prices at time of writing — override via env if they change)
-const PRICE_INPUT_PER_M  = Number(process.env.OPENAI_PRICE_INPUT_PER_M)  || 2.5;
-const PRICE_OUTPUT_PER_M = Number(process.env.OPENAI_PRICE_OUTPUT_PER_M) || 10;
+
+// Models: photos need full GPT-4o; the text-only steps (Pass 3 verify and
+// /api/fix) are simple enough for the much cheaper GPT-4o mini.
+// Mini isn't cheaper for images (it bills image tokens at a big multiplier).
+const MODEL_VISION = (process.env.OPENAI_MODEL_VISION || "gpt-4o").trim();
+const MODEL_TEXT   = (process.env.OPENAI_MODEL_TEXT   || "gpt-4o-mini").trim();
+
+// Estimated USD per 1M tokens [input, output] — list prices at time of writing.
+// Override with OPENAI_PRICES='{"gpt-4o":[2.5,10]}'; OPENAI_PRICE_INPUT_PER_M /
+// OPENAI_PRICE_OUTPUT_PER_M still override the vision model's price.
+const PRICES = { "gpt-4o": [2.5, 10], "gpt-4o-mini": [0.15, 0.6] };
+try {
+  Object.assign(PRICES, JSON.parse(process.env.OPENAI_PRICES || "{}"));
+} catch {
+  console.warn("OPENAI_PRICES is not valid JSON — using default prices");
+}
+if (process.env.OPENAI_PRICE_INPUT_PER_M || process.env.OPENAI_PRICE_OUTPUT_PER_M) {
+  const [inP, outP] = PRICES[MODEL_VISION] || PRICES["gpt-4o"];
+  PRICES[MODEL_VISION] = [
+    Number(process.env.OPENAI_PRICE_INPUT_PER_M) || inP,
+    Number(process.env.OPENAI_PRICE_OUTPUT_PER_M) || outP,
+  ];
+}
+
+/** Price for a model name as reported by the API (e.g. "gpt-4o-mini-2024-07-18"). */
+function priceFor(model) {
+  if (PRICES[model]) return { price: PRICES[model], known: true };
+  // Longest configured name that the reported (dated) model name starts with
+  const base = Object.keys(PRICES)
+    .filter((k) => model.startsWith(k + "-"))
+    .sort((a, b) => b.length - a.length)[0];
+  if (base) return { price: PRICES[base], known: true };
+  return { price: PRICES["gpt-4o"] || [2.5, 10], known: false };
+}
 
 /** Run fn with a fresh usage tally; returns { result | error, usage }. */
 async function withUsage(fn) {
-  const usage = { calls: 0, input_tokens: 0, output_tokens: 0 };
+  const usage = { calls: 0, input_tokens: 0, output_tokens: 0, by_pass: {}, by_model: {} };
   return usageStore.run(usage, fn).then(
     (result) => ({ result, usage }),
     (error) => ({ error, usage })
   );
 }
 
+/** Add one call's token usage to the current request's tally. */
+function recordUsage(schemaName, model, inTok, outTok) {
+  const usage = usageStore.getStore();
+  if (!usage) return;
+  usage.calls += 1;
+  usage.input_tokens += inTok;
+  usage.output_tokens += outTok;
+  const p = (usage.by_pass[schemaName] ||= { calls: 0, in: 0, out: 0 });
+  p.calls += 1; p.in += inTok; p.out += outTok;
+  const m = (usage.by_model[model] ||= { calls: 0, in: 0, out: 0 });
+  m.calls += 1; m.in += inTok; m.out += outTok;
+}
+
 /** Log one structured line with tokens and estimated cost for a request. */
 function logUsage(event, usage, extra = {}) {
-  const est = (usage.input_tokens * PRICE_INPUT_PER_M + usage.output_tokens * PRICE_OUTPUT_PER_M) / 1e6;
-  console.log(JSON.stringify({ event, ...usage, est_usd: Number(est.toFixed(4)), ...extra }));
+  let est = 0;
+  let priceUnknown = false;
+  for (const [model, m] of Object.entries(usage.by_model)) {
+    const { price: [inP, outP], known } = priceFor(model);
+    if (!known) priceUnknown = true;
+    est += (m.in * inP + m.out * outP) / 1e6;
+  }
+  console.log(JSON.stringify({
+    event,
+    calls: usage.calls,
+    input_tokens: usage.input_tokens,
+    output_tokens: usage.output_tokens,
+    est_usd: Number(est.toFixed(4)),
+    ...(priceUnknown ? { price_unknown: true } : {}),
+    ...extra,
+    by_pass: usage.by_pass,
+    by_model: usage.by_model,
+  }));
 }
 
 // ---------------------------------------------------------------------------
@@ -96,11 +156,27 @@ async function rejectBots(req, res) {
 // BotID's browser script reads process.env.NODE_ENV, which only exists under a
 // bundler. Serve it with that value filled in ("development" off Vercel, where
 // BotID skips itself), so the page can load it as a plain ES module.
-const BOTID_CLIENT_JS = fs
-  .readFileSync(require.resolve("botid/client/core").replace(/index\.js$/, "index.mjs"), "utf8")
-  .replaceAll("process.env.NODE_ENV", JSON.stringify(process.env.VERCEL ? "production" : "development"));
+// The .mjs file is never require()d, so Vercel only ships it because it's
+// listed in vercel.json "includeFiles". It's read lazily so a missing file
+// breaks only this one URL, never the whole app at startup.
+let botIdClientJs = null;
+function getBotIdClientJs() {
+  if (botIdClientJs === null) {
+    try {
+      botIdClientJs = fs
+        .readFileSync(require.resolve("botid/client/core").replace(/index\.js$/, "index.mjs"), "utf8")
+        .replaceAll("process.env.NODE_ENV", JSON.stringify(process.env.VERCEL ? "production" : "development"));
+    } catch (err) {
+      console.error("BotID browser script missing from deployment — check includeFiles in vercel.json:", err.message);
+      botIdClientJs = false;
+    }
+  }
+  return botIdClientJs;
+}
 app.get("/vendor/botid.mjs", (_req, res) => {
-  res.type("application/javascript").set("Cache-Control", "public, max-age=3600").send(BOTID_CLIENT_JS);
+  const js = getBotIdClientJs();
+  if (!js) return res.status(503).type("text/plain").send("BotID script unavailable");
+  res.type("application/javascript").set("Cache-Control", "public, max-age=3600").send(js);
 });
 
 app.use(express.static(path.join(__dirname, "public")));
@@ -257,14 +333,84 @@ const COUNT_SCHEMA = {
   additionalProperties: false,
 };
 const TILE_SCHEMA   = booksSchema();
-const VERIFY_SCHEMA = booksSchema({ corrected: { type: "boolean" } });
-const VISUAL_SCHEMA = booksSchema({ corrected: { type: "boolean" }, visible: { type: "boolean" } });
+// Pass 3 returns only the corrections (1-based indexes), not the whole list again —
+// output tokens cost 4× input, so echoing every book was most of this pass's cost.
+const VERIFY_EDITS_SCHEMA = {
+  type: "object",
+  properties: {
+    edits: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          index:  { type: "integer" },
+          title:  { type: "string" },
+          author: { type: "string" },
+        },
+        required: ["index", "title", "author"],
+        additionalProperties: false,
+      },
+    },
+    remove: { type: "array", items: { type: "integer" } },
+  },
+  required: ["edits", "remove"],
+  additionalProperties: false,
+};
+// Pass 4 returns only the numbers of books it can't find in the photo.
+const NOT_VISIBLE_SCHEMA = {
+  type: "object",
+  properties: { notVisible: { type: "array", items: { type: "integer" } } },
+  required: ["notVisible"],
+  additionalProperties: false,
+};
+
+/** Numbered list as shown to GPT: `1. "Title" by Author`. */
+function numberedList(books) {
+  return books
+    .map((b, i) => `${i + 1}. "${b.title || "(no title)"}" by ${b.author || "Unknown"}`)
+    .join("\n");
+}
+
+/**
+ * Apply Pass 3's edits/removals to the list. Pure: untouched books keep every
+ * field; edited books keep their confidence and get corrected: true.
+ * Out-of-range, duplicate and no-op entries are ignored.
+ */
+function applyVerifyEdits(books, result) {
+  const inRange = (i) => Number.isInteger(i) && i >= 1 && i <= books.length;
+  const out = books.map((b) => ({ ...b }));
+  const seen = new Set();
+  let corrected = 0;
+  for (const e of result?.edits || []) {
+    if (!inRange(e.index) || seen.has(e.index)) continue;
+    seen.add(e.index);
+    const b = out[e.index - 1];
+    const title = String(e.title || "").trim() || b.title;
+    const author = String(e.author || "").trim() || b.author;
+    if (title === b.title && author === b.author) continue;
+    b.title = title;
+    b.author = author;
+    b.corrected = true;
+    corrected += 1;
+  }
+  const drop = new Set((result?.remove || []).filter(inRange));
+  return { books: out.filter((_, i) => !drop.has(i + 1)), corrected, removed: drop.size };
+}
+
+/** Drop the books Pass 4 couldn't see (1-based indexes); out-of-range ignored. */
+function dropNotVisible(books, notVisible) {
+  const drop = new Set((notVisible || []).filter((i) => Number.isInteger(i) && i >= 1 && i <= books.length));
+  return {
+    books: books.filter((_, i) => !drop.has(i + 1)),
+    removed: books.filter((_, i) => drop.has(i + 1)).map((b) => b.title),
+  };
+}
 
 /**
  * Call GPT with a strict JSON schema and return the parsed object.
  * Throws on refusals and on truncated output (callers fall back where they can).
  */
-async function callJson({ model = "gpt-4o", max_tokens, messages, schemaName, schema, signal }) {
+async function callJson({ model = MODEL_VISION, max_tokens, messages, schemaName, schema, signal }) {
   const completion = await openai.chat.completions.create(
     {
       model,
@@ -277,12 +423,12 @@ async function callJson({ model = "gpt-4o", max_tokens, messages, schemaName, sc
     },
     { signal }
   );
-  const usage = usageStore.getStore();
-  if (usage) {
-    usage.calls += 1;
-    usage.input_tokens += completion.usage?.prompt_tokens || 0;
-    usage.output_tokens += completion.usage?.completion_tokens || 0;
-  }
+  recordUsage(
+    schemaName,
+    completion.model || model,
+    completion.usage?.prompt_tokens || 0,
+    completion.usage?.completion_tokens || 0
+  );
   const choice = completion.choices[0];
   if (choice.message.refusal) {
     throw new Error(`Model refused (${schemaName}): ${choice.message.refusal}`);
@@ -293,7 +439,7 @@ async function callJson({ model = "gpt-4o", max_tokens, messages, schemaName, sc
   return parseGptJson(choice.message.content);
 }
 
-/** Pass 1 – quick count & overview using auto detail for accuracy */
+/** Pass 1 – quick count & overview. Low detail is enough for a rough count (it only steers the tile grid) and costs 85 image tokens instead of ~765. */
 async function countBooks(dataUri, signal) {
   return callJson({
     schemaName: "book_count",
@@ -320,7 +466,7 @@ Return an object with these fields:
       {
         role: "user",
         content: [
-          { type: "image_url", image_url: { url: dataUri, detail: "auto" } },
+          { type: "image_url", image_url: { url: dataUri, detail: "low" } },
           { type: "text", text: "How many books are visible in this image? Count carefully — look for thin spines and partially hidden books. Err on the side of counting more rather than fewer." },
         ],
       },
@@ -482,18 +628,17 @@ function deduplicateBooks(allBooks) {
 async function verifyAndCleanBooks(books, signal) {
   if (books.length === 0) return books;
 
-  const bookListJson = JSON.stringify(books);
-
   try {
     const result = await callJson({
-      schemaName: "verified_books",
-      schema: VERIFY_SCHEMA,
+      model: MODEL_TEXT,
+      schemaName: "verify_edits",
+      schema: VERIFY_EDITS_SCHEMA,
       signal,
-      max_tokens: 4096,
+      max_tokens: 2048,
       messages: [
         {
           role: "system",
-          content: `You are a book-data quality checker. You will receive a JSON array of books identified from a bookshelf photo.
+          content: `You are a book-data quality checker. You will receive a numbered list of books identified from a bookshelf photo.
 
 Your job is to FIX common errors:
 
@@ -503,24 +648,24 @@ Your job is to FIX common errors:
 4. UNKNOWN AUTHOR: If the author is "Unknown" but you recognize the book from its title, fill in the correct author.
 5. WRONG AUTHOR: If you know the real author of a well-known book and it doesn't match, correct it.
 6. TITLE CLEANUP: Fix obvious OCR-style errors in titles (e.g. "Tnr Hobbit" → "The Hobbit"). But do NOT change titles you don't recognize — they might be correct niche books.
-7. DUPLICATE DETECTION: If two entries are clearly the same book (e.g. "The Hobbit" and "Hobbit, The"), keep only the one with higher confidence. Also merge entries that are clearly variations (e.g. one with a subtitle and one without).
+7. DUPLICATE DETECTION: If two entries are clearly the same book (e.g. "The Hobbit" and "Hobbit, The"), keep one and remove the other. Also merge entries that are clearly variations (e.g. one with a subtitle and one without).
 8. REPEATED TEXT IN TITLE: If a title contains the same phrase repeated, clean it to just the real title.
 9. SUMMARY/REVIEW BOOKS: If a title starts with "Summary of", "Review of", etc., change it to the real book title.
 10. GARBAGE ENTRIES: Remove entries where the title is just a single word that is clearly an author's first or last name, or entries that don't represent actual books.
 
-For each book, preserve the original confidence field. If you made a correction, set "corrected": true on that entry.
-
-Return an object with the corrected "books" array in the same format:
-{"books":[{"title":"...","author":"...","confidence":0-100,"corrected":true|false}]}`,
+Return ONLY what needs changing — leave correct books out entirely:
+- "edits": books to correct, each with its list number ("index") and the full corrected title and author (repeat a field that doesn't change exactly as it was).
+- "remove": list numbers of duplicates and garbage entries to delete (for a duplicate pair, remove the less complete one).
+If everything looks right, return {"edits":[],"remove":[]}.`,
         },
         {
           role: "user",
-          content: `Please review and fix any issues in this book list:\n${bookListJson}`,
+          content: `Please review and fix any issues in this book list:\n${numberedList(books)}`,
         },
       ],
     });
-    const cleaned = result.books;
-    console.log(`  Pass 3 (verify) → ${cleaned.filter(b => b.corrected).length} corrections made`);
+    const { books: cleaned, corrected, removed } = applyVerifyEdits(books, result);
+    console.log(`  Pass 3 (verify) → ${corrected} corrections, ${removed} removed`);
     return cleaned;
   } catch (e) {
     if (signal?.aborted) throw e;
@@ -537,16 +682,12 @@ Return an object with the corrected "books" array in the same format:
 async function visuallyVerifyBooks(books, imageDataUri, signal) {
   if (books.length === 0) return books;
 
-  const bookListText = books
-    .map((b, i) => `${i + 1}. "${b.title}" by ${b.author} [confidence: ${b.confidence}, corrected: ${!!b.corrected}]`)
-    .join("\n");
-
   try {
     const result = await callJson({
-      schemaName: "visible_books",
-      schema: VISUAL_SCHEMA,
+      schemaName: "not_visible_books",
+      schema: NOT_VISIBLE_SCHEMA,
       signal,
-      max_tokens: 4096,
+      max_tokens: 512,
       messages: [
         {
           role: "system",
@@ -554,21 +695,22 @@ async function visuallyVerifyBooks(books, imageDataUri, signal) {
 
 Your job: look at the actual photo and decide, for EACH book in the list, whether you can genuinely see that book's spine or cover in the image.
 
-Mark a book "visible": true ONLY if:
+A book is visible if:
 - You can find its spine or cover somewhere in the image.
 - At least part of the title text is actually readable on a spine you can see.
 - Or you can confidently identify it from clearly recognisable cover art.
 
-Mark a book "visible": false if:
+A book is NOT visible if:
 - You cannot find any spine in the image that plausibly matches this title.
 - The title seems to have been invented — no visible spine corresponds to it.
 - The entry looks like a garbled mis-reading of a different book that IS on the shelf.
 
-Do NOT over-reject: if you are genuinely unsure, lean toward visible=true.
-But hallucinated books — those with no matching spine anywhere — must be marked visible=false.
+Do NOT over-reject: if you are genuinely unsure, treat the book as visible.
+But hallucinated books — those with no matching spine anywhere — must be listed as not visible.
 
-Return an object with a "books" array containing EVERY book from the list, each with the same title, author, confidence and corrected values you were given, plus "visible":
-{"books":[{"title":"...","author":"...","confidence":0-100,"corrected":true|false,"visible":true}]}`,
+Return ONLY the list numbers of the books that are NOT visible:
+{"notVisible":[3,7]}
+If every book is visible, return {"notVisible":[]}.`,
         },
         {
           role: "user",
@@ -576,23 +718,19 @@ Return an object with a "books" array containing EVERY book from the list, each 
             { type: "image_url", image_url: { url: imageDataUri, detail: "high" } },
             {
               type: "text",
-              text: `Here is the list of books the scanner identified. Please look at the photo and set "visible": true only for books whose spine or cover you can actually see:\n\n${bookListText}`,
+              text: `Here is the list of books the scanner identified. Please look at the photo and list the numbers of any books whose spine or cover you can NOT find:\n\n${numberedList(books)}`,
             },
           ],
         },
       ],
     });
-    const verified = result.books;
-    const removed = verified.filter((b) => b.visible === false).map((b) => b.title);
+    const { books: confirmed, removed } = dropNotVisible(books, result.notVisible);
     if (removed.length > 0) {
       console.log(`  Pass 4 (visual verify) → removed ${removed.length} unconfirmed book(s): ${removed.join(", ")}`);
     } else {
       console.log(`  Pass 4 (visual verify) → all books confirmed`);
     }
-    // Strip the helper field and return only confirmed books
-    return verified
-      .filter((b) => b.visible !== false)
-      .map(({ visible: _v, ...rest }) => rest);
+    return confirmed;
   } catch (e) {
     if (signal?.aborted) throw e;
     console.warn("  Pass 4 (visual verify) failed, keeping unverified results:", e.message);
@@ -1224,6 +1362,7 @@ async function describeFixes(books, instruction) {
     ? books.map((b, i) => `${i + 1}. "${b.title || "(no title)"}" by ${b.author || "Unknown"}`).join("\n")
     : "(the list is empty)";
   return callJson({
+    model: MODEL_TEXT,
     schemaName: "book_fixes",
     schema: FIX_SCHEMA,
     max_tokens: 2048,
