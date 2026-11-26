@@ -554,6 +554,7 @@ If no books are visible in this section, return {"books":[]}.`,
 function normalizeTitle(t) {
   return (t || "")
     .toLowerCase()
+    .replace(/&/g, "and") // "Toast & Jam" == "Toast and Jam"
     .replace(/[^a-z0-9]/g, "")
     .trim();
 }
@@ -1026,10 +1027,14 @@ async function googleBooksQuery(q, signal) {
 function pickMatchingDoc(docs, book) {
   const want = normalizeTitle(book.title);
   if (!want) return null;
+  const mainTitle = (t) => normalizeTitle((t || "").split(/[:(]/)[0]);
+  const authorKnown = book.author && book.author !== "Unknown";
   const titleOk = (docTitle) => {
     // Short titles ("It", "Emma") need an exact main-title match, otherwise
     // substring matching would accept "Ithaca" for "It".
-    if (want.length < 5) return normalizeTitle((docTitle || "").split(":")[0]) === want;
+    // With no author to check, also insist on the main title, or
+    // "The Three-Body Problem" would accept "Death's End (The Three-Body Problem…)".
+    if (want.length < 5 || !authorKnown) return mainTitle(docTitle) === mainTitle(book.title);
     return titlesAreSimilar(want, normalizeTitle(docTitle));
   };
   return docs.find((doc) =>
@@ -1235,51 +1240,27 @@ async function lookupOneBook(book) {
     return result;
   }
 
+  // Different searches to find candidates; every candidate must pass the same
+  // title + author check as the scan's catalog pass (pickMatchingDoc). There is
+  // deliberately no "ignore the author" fallback: that once turned "The Joy of
+  // Costco" into an unrelated book that shares the word "Costco". If nothing
+  // matches, the book keeps its scanned title/author (matched: false).
+  const author = book.author && book.author !== "Unknown" ? book.author : "";
+  const mainTitle = book.title.split(/[:\u2014\-\u2013]/)[0].trim();
   const strategies = [
-    // Strategy 1: title + author (general search)
-    { query: () => `${book.title} ${book.author !== "Unknown" ? book.author : ""}`.trim(), useAuthorFilter: true },
-    // Strategy 2: title only (general search), with author filter
-    { query: () => book.title, useAuthorFilter: true },
-    // Strategy 3: title field search (more precise), with author filter
-    { query: () => book.title, useAuthorFilter: true, titleField: true },
-    // Strategy 4: title without subtitle, general search
-    { query: () => book.title.split(/[:\u2014\-\u2013]/)[0].trim(), useAuthorFilter: true },
-    // Strategy 5: title field search, NO author filter (last resort)
-    { query: () => book.title, useAuthorFilter: false, titleField: true },
-    // Strategy 6: title without subtitle, NO author filter
-    { query: () => book.title.split(/[:\u2014\-\u2013]/)[0].trim(), useAuthorFilter: false },
+    { query: `${book.title} ${author}`.trim() },          // title + author
+    { query: book.title },                                 // title only
+    { query: book.title, titleField: true },               // title field search
+    { query: mainTitle },                                  // title without subtitle
   ];
 
-  for (const strategy of strategies) {
-    const query = strategy.query();
+  for (const { query, titleField } of strategies) {
     if (!query || query.length < 2) continue;
-
-    try {
-      const docs = strategy.titleField
-        ? await searchOpenLibraryByTitle(query, 5)
-        : await searchOpenLibrary(query, 5);
-
-      for (const doc of docs) {
-        // Skip summary/review knockoffs
-        if (isSummaryKnockoff(doc.title, book.title)) continue;
-
-        // Validate author match only if strategy requires it
-        if (strategy.useAuthorFilter) {
-          const candidateAuthor = (doc.author_name || []).join(", ");
-          if (!authorsMatch(book.author, candidateAuthor)) continue;
-        }
-
-        // Basic title sanity check: at least one significant word should overlap
-        const normQ = query.toLowerCase().replace(/[^a-z0-9\s]/g, "").split(/\s+/).filter(w => w.length > 2);
-        const normT = (doc.title || "").toLowerCase().replace(/[^a-z0-9\s]/g, "").split(/\s+/).filter(w => w.length > 2);
-        const titleOverlap = normQ.some(qw => normT.some(tw => tw.includes(qw) || qw.includes(tw)));
-        if (!titleOverlap && normQ.length > 0) continue;
-
-        return docToResult(doc, book);
-      }
-    } catch {
-      // try next strategy
-    }
+    const docs = titleField
+      ? await searchOpenLibraryByTitle(query, 5)
+      : await searchOpenLibrary(query, 5);
+    const doc = pickMatchingDoc(docs, book);
+    if (doc) return docToResult(doc, book);
   }
 
   // Open Library had nothing — try Google Books before giving up

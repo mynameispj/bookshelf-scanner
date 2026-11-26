@@ -76,7 +76,7 @@ All passes live in `runScan()` and use OpenAI Structured Outputs (`callJson()` w
 |----------|--------|-------------|
 | `/api/scan` | POST | Upload image → identified books (multipart form; NDJSON stream if requested) |
 | `/api/fix` | POST | `{ books, instruction }` → apply a plain-words correction ("book 3 is by Le Guin", "remove the cookbook", "add Dune"). Returns `{ books, reply, changed, updated, removed, added }`. Instruction ≤ 500 chars, ≤ 300 books |
-| `/api/lookup` | POST | Enrich book list with ISBN & metadata. Books with an `isbn13` (barcode/typed) are looked up exactly by ISBN; others reuse scan-time catalog matches, then Open Library, then Google Books. Max 500 books, 6 at a time |
+| `/api/lookup` | POST | Enrich book list with ISBN & metadata. Books with an `isbn13` (barcode/typed) are looked up exactly by ISBN; others reuse scan-time catalog matches, then Open Library, then Google Books. Every candidate must pass `pickMatchingDoc()` (same title + author check as the catalog pass; with no author, the main title must match exactly) — there is no "ignore the author" fallback, so an unmatched book keeps its scanned title/author (`matched: false`) instead of being swapped for a look-alike. Max 500 books, 6 at a time |
 
 ### Frontend Flow
 
