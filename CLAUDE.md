@@ -42,6 +42,8 @@ No build step, no test suite, no linter configured.
 | `OPENAI_API_KEY` | Yes | OpenAI API key for GPT-4o Vision |
 | `PORT` | No | Server port (defaults to 3000) |
 | `GOOGLE_BOOKS_API_KEY` | No | Google Books key for the catalog check; without it Google Books is often rate-limited (treated as "unknown") |
+| `BOTID_MODE` | No | `enforce` (default) blocks bots on the paid endpoints; `log` only logs verdicts; `off` disables the check |
+| `OPENAI_PRICE_INPUT_PER_M` / `OPENAI_PRICE_OUTPUT_PER_M` | No | USD per 1M tokens used for the estimated cost in `scan_usage`/`fix_usage` logs (defaults 2.5 / 10, gpt-4o list prices) |
 
 Copy `.env.example` to `.env` and fill in values.
 
@@ -86,6 +88,14 @@ Three-step wizard: **Capture** → **Review & Edit** → **Export CSV**
 
 The review step has a "✏️ Fix it by describing it" box; review cards are numbered so users can say "book 3". `/api/fix` asks GPT (`describeFixes()`, strict `FIX_SCHEMA`) for **edits, not a rewritten list** — `{index, action: update|remove, title, author}` plus `additions` and a one-sentence `reply` — and `applyFixes()` applies them: out-of-range/duplicate indexes and no-op edits are ignored, untouched books keep every field (ISBNs, catalog data), updated/added books get `fixed: true` and confidence 100. Ambiguous requests return no edits and an explanation in `reply`. The client keeps one level of undo and highlights changed cards.
 
+### Cost protection
+
+Every scan can make ~20 GPT-4o calls, so the paid endpoints are protected:
+- **Vercel BotID** (basic, free) on `POST /api/scan`, `/api/fix` and `/api/lookup`. The browser part is `botid/client/core`, served by `server.js` at `/vendor/botid.mjs` with `process.env.NODE_ENV` filled in (no bundler), and loaded as a module in `index.html` with the same three routes in `protect`. The server calls `rejectBots()` at the top of each handler — before multer saves the upload for `/api/scan` — and returns 403 JSON for bots. Off Vercel (local dev, no OIDC token) the check throws and **fails open** with one log line. The two BotID routes in `vercel.json` must stay **above** the catch-all route. `curl`/Postman calls to these endpoints are reported as bots on Vercel, as intended.
+- **Rate limits** are a Vercel Firewall rule (dashboard), not code. The client shows friendly messages for 429 and 403 via `readJsonOrThrow()` / `friendlyHttpError()` in `app.js`.
+- **Cost logging:** `callJson()` adds each call's token usage to a per-request tally (`AsyncLocalStorage`, via `withUsage()`); each scan/fix logs one JSON line — `{"event":"scan_usage","calls",…,"input_tokens","output_tokens","est_usd","outcome","books","ms"}` — searchable in Vercel logs.
+- **Owner-side hard cap:** set a monthly budget limit on the OpenAI project.
+
 ### ISBN barcode scanning
 
 "🏷️ Scan ISBN Barcodes" (capture step) and "Add by Barcode" (review step) open a camera overlay that reads EAN-13 barcodes with **ZXing** (`@zxing/browser@0.2.1` UMD from jsDelivr, pinned with an SRI `integrity` hash — the only third-party script; update the hash if you bump the version). Only valid ISBN-13s starting 978/979 are accepted (other barcodes such as prices are ignored); ISBNs can also be typed (ISBN-10 is converted). On Done, ISBNs go to `/api/lookup` → `lookupByIsbn()` (Open Library, one retry, then Google Books) and are added to the review list as `source: "barcode"` at 100% confidence. The scanned ISBN is always kept, even when unmatched, so it still exports to Libib; `lookupFailed: true` means the catalogs didn't respond (not "not found"). The camera needs HTTPS (or localhost).
@@ -106,6 +116,7 @@ The review step has a "✏️ Fix it by describing it" box; review cards are num
 | openai | GPT-4o Vision API client |
 | sharp | Image resize/crop/tile processing |
 | dotenv | Load .env variables |
+| botid | Vercel BotID bot protection (server check + browser script served at `/vendor/botid.mjs`) |
 
 No dev dependencies.
 
@@ -117,5 +128,6 @@ No dev dependencies.
 - **API key whitespace:** Key is trimmed on load to prevent trailing newline issues
 - **Slow catalogs:** Open Library searches often take 2–3 s; the catalog pass is time-boxed so it can't push a scan past Vercel's limit
 - **Local testing behind a proxy:** Node's built-in `fetch` ignores `HTTPS_PROXY`; run with `NODE_USE_ENV_PROXY=1` (Node ≥ 22.21) if catalog requests fail with `fetch failed`
+- **BotID says "check unavailable" in logs on Vercel:** the project needs OIDC enabled (Project → Settings → Security → "Secure backend access with OIDC federation"); until then requests are allowed
 - **`.hidden` on buttons:** `.btn` sets `display`, so buttons need `.btn.hidden` (in style.css) to actually hide
 - **Unreadable formats (e.g. HEIC):** `/api/scan` checks the image decodes with sharp before streaming and returns 415 with instructions

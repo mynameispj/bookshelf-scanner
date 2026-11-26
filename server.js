@@ -5,6 +5,8 @@ const OpenAI = require("openai");
 const sharp = require("sharp");
 const fs = require("fs");
 const path = require("path");
+const { AsyncLocalStorage } = require("async_hooks");
+const { checkBotId } = require("botid/server");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -28,8 +30,79 @@ const upload = multer({ storage, limits: { fileSize: 20 * 1024 * 1024 } });
 const openai = new OpenAI({ apiKey: (process.env.OPENAI_API_KEY || "").trim() });
 
 // ---------------------------------------------------------------------------
+// Cost tracking – every GPT call adds its token usage to the current request's
+// tally (AsyncLocalStorage keeps one tally per request without threading it
+// through every function). Logged as one "scan_usage"/"fix_usage" line.
+// ---------------------------------------------------------------------------
+const usageStore = new AsyncLocalStorage();
+// Estimated USD per 1M tokens (gpt-4o list prices at time of writing — override via env if they change)
+const PRICE_INPUT_PER_M  = Number(process.env.OPENAI_PRICE_INPUT_PER_M)  || 2.5;
+const PRICE_OUTPUT_PER_M = Number(process.env.OPENAI_PRICE_OUTPUT_PER_M) || 10;
+
+/** Run fn with a fresh usage tally; returns { result | error, usage }. */
+async function withUsage(fn) {
+  const usage = { calls: 0, input_tokens: 0, output_tokens: 0 };
+  return usageStore.run(usage, fn).then(
+    (result) => ({ result, usage }),
+    (error) => ({ error, usage })
+  );
+}
+
+/** Log one structured line with tokens and estimated cost for a request. */
+function logUsage(event, usage, extra = {}) {
+  const est = (usage.input_tokens * PRICE_INPUT_PER_M + usage.output_tokens * PRICE_OUTPUT_PER_M) / 1e6;
+  console.log(JSON.stringify({ event, ...usage, est_usd: Number(est.toFixed(4)), ...extra }));
+}
+
+// ---------------------------------------------------------------------------
+// Bot protection – Vercel BotID on the endpoints that cost money
+// ---------------------------------------------------------------------------
+// BOTID_MODE: "enforce" (default) blocks bots; "log" only logs verdicts;
+// "off" skips the check. Off Vercel (local dev) the check can't run and fails open.
+const BOTID_MODE = (process.env.BOTID_MODE || "enforce").toLowerCase();
+let botIdUnavailableLogged = false;
+
+/** Returns true (and sends a 403) if the request looks automated. */
+async function rejectBots(req, res) {
+  if (BOTID_MODE === "off") return false;
+  try {
+    const verdict = await checkBotId({
+      advancedOptions: {
+        headers: req.headers,
+        vercelOidcToken: req.headers["x-vercel-oidc-token"] || process.env.VERCEL_OIDC_TOKEN,
+      },
+    });
+    if (verdict.isBot && !verdict.isVerifiedBot) {
+      console.warn(JSON.stringify({ event: "bot_blocked", path: req.path, mode: BOTID_MODE }));
+      if (BOTID_MODE === "enforce") {
+        res.status(403).json({ error: "Automated requests aren't allowed. Please use the app in a browser." });
+        return true;
+      }
+    }
+  } catch (err) {
+    // Not on Vercel (no OIDC token / request context): allow, so local dev keeps working.
+    if (!botIdUnavailableLogged) {
+      botIdUnavailableLogged = true;
+      console.warn("  BotID check unavailable, allowing requests:", err?.message || err);
+    }
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
 // Static files
 // ---------------------------------------------------------------------------
+
+// BotID's browser script reads process.env.NODE_ENV, which only exists under a
+// bundler. Serve it with that value filled in ("development" off Vercel, where
+// BotID skips itself), so the page can load it as a plain ES module.
+const BOTID_CLIENT_JS = fs
+  .readFileSync(require.resolve("botid/client/core").replace(/index\.js$/, "index.mjs"), "utf8")
+  .replaceAll("process.env.NODE_ENV", JSON.stringify(process.env.VERCEL ? "production" : "development"));
+app.get("/vendor/botid.mjs", (_req, res) => {
+  res.type("application/javascript").set("Cache-Control", "public, max-age=3600").send(BOTID_CLIENT_JS);
+});
+
 app.use(express.static(path.join(__dirname, "public")));
 app.use(express.json({ limit: "1mb" })); // book lists carry catalog data; 100kb default is too small
 
@@ -204,6 +277,12 @@ async function callJson({ model = "gpt-4o", max_tokens, messages, schemaName, sc
     },
     { signal }
   );
+  const usage = usageStore.getStore();
+  if (usage) {
+    usage.calls += 1;
+    usage.input_tokens += completion.usage?.prompt_tokens || 0;
+    usage.output_tokens += completion.usage?.completion_tokens || 0;
+  }
   const choice = completion.choices[0];
   if (choice.message.refusal) {
     throw new Error(`Model refused (${schemaName}): ${choice.message.refusal}`);
@@ -524,7 +603,9 @@ Return an object with a "books" array containing EVERY book from the list, each 
 // ---------------------------------------------------------------------------
 // POST /api/scan  – accept an image, return identified books (two-pass + tiling)
 // ---------------------------------------------------------------------------
-app.post("/api/scan", (req, res, next) => {
+app.post("/api/scan", async (req, res, next) => {
+  // Check for bots before accepting the upload, so they can't even send a photo
+  if (await rejectBots(req, res)) return;
   upload.single("photo")(req, res, (err) => {
     if (err) {
       if (err.code === "LIMIT_FILE_SIZE") {
@@ -574,10 +655,17 @@ app.post("/api/scan", (req, res, next) => {
     };
   }
 
-  try {
-    const mimeType = req.file.mimetype || "image/jpeg";
-    const result = await runScan(imageBuffer, mimeType, emit, controller.signal);
+  const startedAt = Date.now();
+  const mimeType = req.file.mimetype || "image/jpeg";
+  const { result, error, usage } = await withUsage(() => runScan(imageBuffer, mimeType, emit, controller.signal));
+  logUsage("scan_usage", usage, {
+    outcome: error ? (controller.signal.aborted ? "aborted" : "error") : "ok",
+    books: result?.books?.length ?? null,
+    ms: Date.now() - startedAt,
+  });
 
+  try {
+    if (error) throw error;
     if (streaming) {
       emit({ type: "result", ...result });
       res.end();
@@ -1070,6 +1158,7 @@ async function lookupOneBook(book) {
 }
 
 app.post("/api/lookup", async (req, res) => {
+  if (await rejectBots(req, res)) return;
   try {
     const { books } = req.body;
     if (!Array.isArray(books))
@@ -1211,6 +1300,7 @@ function applyFixes(books, { edits = [], additions = [], reply = "" }) {
 }
 
 app.post("/api/fix", async (req, res) => {
+  if (await rejectBots(req, res)) return;
   const { books, instruction } = req.body || {};
   if (typeof instruction !== "string" || !instruction.trim())
     return res.status(400).json({ error: "Describe what to fix." });
@@ -1221,8 +1311,11 @@ app.post("/api/fix", async (req, res) => {
   if (books.length > FIX_MAX_BOOKS)
     return res.status(400).json({ error: `Too many books for one fix (max ${FIX_MAX_BOOKS}).` });
 
+  const startedAt = Date.now();
+  const { result, error, usage } = await withUsage(() => describeFixes(books, instruction.trim()));
+  logUsage("fix_usage", usage, { outcome: error ? "error" : "ok", books: books.length, ms: Date.now() - startedAt });
   try {
-    const result = await describeFixes(books, instruction.trim());
+    if (error) throw error;
     const applied = applyFixes(books, result);
     console.log(`  Fix → ${applied.updated} updated, ${applied.removed} removed, ${applied.added} added`);
     res.json(applied);

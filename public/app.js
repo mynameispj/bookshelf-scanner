@@ -185,18 +185,14 @@ btnScan.addEventListener("click", async () => {
     const contentType = res.headers.get("content-type") || "";
     if (contentType.includes("application/x-ndjson")) {
       await readNdjson(res, onScanEvent);
-    } else if (contentType.includes("application/json")) {
-      // Errors raised before streaming starts (upload too large, no file, …)
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error);
-      identifiedBooks = data.books;
     } else {
-      // Non-JSON error responses (e.g. Vercel HTML error pages)
-      const text = await res.text();
-      if (res.status === 413) throw new Error("Image too large. Please use a smaller photo.");
-      if (res.status === 415) throw new Error("Couldn't read this image format — please upload a JPEG or PNG.");
-      if (res.status >= 500) throw new Error(`Server error (${res.status}). Please try again in a moment.`);
-      throw new Error(`Unexpected response (${res.status}): ${text.slice(0, 120)}`);
+      // Errors raised before streaming starts (upload too large, bot check,
+      // rate limit, …) — JSON from our server or HTML/text from Vercel.
+      if (res.status === 415 && !contentType.includes("application/json")) {
+        throw new Error("Couldn't read this image format — please upload a JPEG or PNG.");
+      }
+      const data = await readJsonOrThrow(res);
+      identifiedBooks = data.books;
     }
 
     renderScanProgress(null);
@@ -340,6 +336,27 @@ function confPercent(c) {
 function confBand(pct) { return pct >= 80 ? "high" : pct >= LOW_CONFIDENCE ? "medium" : "low"; }
 
 function esc(s) { return (s || "").replace(/"/g, "&quot;"); }
+/** User-facing message for HTTP errors that come from Vercel rather than our server. */
+function friendlyHttpError(status) {
+  if (status === 429) return "You've done a lot of scans in a short time — please wait a few minutes and try again.";
+  if (status === 403) return "This request was blocked as automated traffic. Reload the page and try again in your browser.";
+  if (status === 413) return "Image too large. Please use a smaller photo.";
+  if (status >= 500) return `Server error (${status}). Please try again in a moment.`;
+  return `Unexpected response (${status}).`;
+}
+
+/** Parse a JSON API response; throw a readable Error for non-OK or non-JSON replies. */
+async function readJsonOrThrow(res) {
+  const ct = res.headers.get("content-type") || "";
+  if (!ct.includes("application/json")) {
+    if (!res.ok) throw new Error(friendlyHttpError(res.status));
+    throw new Error(`Unexpected response (${res.status}).`);
+  }
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || friendlyHttpError(res.status));
+  return data;
+}
+
 function escHtml(s) {
   return String(s || "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 }
@@ -374,8 +391,7 @@ btnLookup.addEventListener("click", async () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ books: identifiedBooks }),
     });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error);
+    const data = await readJsonOrThrow(res);
 
     enrichedBooks = data.books;
     renderEnrichedList();
@@ -506,9 +522,7 @@ fixForm.addEventListener("submit", async (e) => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ books: identifiedBooks, instruction }),
     });
-    const ct = res.headers.get("content-type") || "";
-    const data = ct.includes("application/json") ? await res.json() : { error: `Server error (${res.status})` };
-    if (!res.ok) throw new Error(data.error || `Server error (${res.status})`);
+    const data = await readJsonOrThrow(res);
 
     const madeChanges = data.updated + data.removed + data.added > 0;
     if (madeChanges) {
@@ -675,8 +689,7 @@ barcodeDone.addEventListener("click", async () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ books: isbns.map((isbn13) => ({ isbn13, title: "", author: "", source: "barcode" })) }),
     });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error);
+    const data = await readJsonOrThrow(res);
     const added = data.books.map((b, i) => ({ ...b, isbn13: b.isbn13 || isbns[i], source: "barcode", confidence: 100 }));
     identifiedBooks = identifiedBooks.concat(added);
     const unreachable = added.filter((b) => !b.matched && b.lookupFailed).length;
