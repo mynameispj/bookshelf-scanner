@@ -43,7 +43,10 @@ No build step, no test suite, no linter configured.
 | `PORT` | No | Server port (defaults to 3000) |
 | `GOOGLE_BOOKS_API_KEY` | No | Google Books key for the catalog check; without it Google Books is often rate-limited (treated as "unknown") |
 | `BOTID_MODE` | No | `enforce` (default) blocks bots on the paid endpoints; `log` only logs verdicts; `off` disables the check |
-| `OPENAI_PRICE_INPUT_PER_M` / `OPENAI_PRICE_OUTPUT_PER_M` | No | USD per 1M tokens used for the estimated cost in `scan_usage`/`fix_usage` logs (defaults 2.5 / 10, gpt-4o list prices) |
+| `OPENAI_MODEL_VISION` | No | Model for the photo passes (count, tiles, visual verify). Default `gpt-4o` |
+| `OPENAI_MODEL_TEXT` | No | Model for the text-only steps (Pass 3 verify, `/api/fix`). Default `gpt-4o-mini`; set `gpt-4o` to switch back |
+| `OPENAI_PRICES` | No | JSON price table for the cost estimate, USD per 1M tokens `[input, output]`, e.g. `{"gpt-4o":[2.5,10]}`. Defaults: gpt-4o 2.5/10, gpt-4o-mini 0.15/0.60 |
+| `OPENAI_PRICE_INPUT_PER_M` / `OPENAI_PRICE_OUTPUT_PER_M` | No | Older override for the vision model's price only (still honoured) |
 
 Copy `.env.example` to `.env` and fill in values.
 
@@ -55,11 +58,11 @@ The scanning process is a multi-pass pipeline:
 
 All passes live in `runScan()` and use OpenAI Structured Outputs (`callJson()` with a strict JSON schema), so responses always parse.
 
-1. **Pass 1 — Count:** Quick GPT-4o call to estimate book count and shelf layout
+1. **Pass 1 — Count:** Quick GPT-4o call at `detail: "low"` (85 image tokens) to estimate book count and shelf layout; it only steers the tile grid
 2. **Pass 2 — Identify:** Adaptive image tiling (2-4 cols, 2-4 rows) with 25% overlap, plus one full-image pass; parallel GPT-4o "high" detail calls via `Promise.allSettled` (a failed section is skipped, not fatal)
 3. **Deduplication:** Merge results across overlapping tiles, keep highest confidence (confidence is an integer 0–100; `toConfidence()` clamps it and maps legacy high/medium/low labels)
-4. **Pass 3 — Verify:** Text-only GPT call to fix title/author mix-ups
-5. **Pass 4 — Visual verify:** Re-show the full image with the list; drop books GPT can't find on the shelf
+4. **Pass 3 — Verify:** Text-only call on `MODEL_TEXT` (gpt-4o mini) to fix title/author mix-ups. It returns **only corrections** (`VERIFY_EDITS_SCHEMA`: `edits` by 1-based index + `remove`), applied by `applyVerifyEdits()` — untouched books keep every field, edited ones keep their confidence and get `corrected: true`
+5. **Pass 4 — Visual verify:** Re-show the full image with the numbered list; GPT returns only the numbers it can't find (`NOT_VISIBLE_SCHEMA`), which `dropNotVisible()` removes
 6. **Pass 5 — Catalog check:** `catalogCheck()` looks each book up in Open Library and Google Books in parallel (4 books at a time, 8 s per request, 25 s for the whole pass). Found in both → +15 confidence, one → +5, neither → −25 and `notInCatalog: true`. A catalog that times out or rate-limits counts as unknown, never "not found". Matches are stored in `book.catalogMatch` (with `matchedFor`), which `/api/lookup` reuses if the title/author weren't edited
 
 ### Streaming scan results
@@ -93,7 +96,8 @@ The review step has a "✏️ Fix it by describing it" box; review cards are num
 Every scan can make ~20 GPT-4o calls, so the paid endpoints are protected:
 - **Vercel BotID** (basic, free) on `POST /api/scan`, `/api/fix` and `/api/lookup`. The browser part is `botid/client/core`, served by `server.js` at `/vendor/botid.mjs` with `process.env.NODE_ENV` filled in (no bundler), and loaded as a module in `index.html` with the same three routes in `protect`. The server calls `rejectBots()` at the top of each handler — before multer saves the upload for `/api/scan` — and returns 403 JSON for bots. Off Vercel (local dev, no OIDC token) the check throws and **fails open** with one log line. The two BotID routes in `vercel.json` must stay **above** the catch-all route. `curl`/Postman calls to these endpoints are reported as bots on Vercel, as intended.
 - **Rate limits** are a Vercel Firewall rule (dashboard), not code. The client shows friendly messages for 429 and 403 via `readJsonOrThrow()` / `friendlyHttpError()` in `app.js`.
-- **Cost logging:** `callJson()` adds each call's token usage to a per-request tally (`AsyncLocalStorage`, via `withUsage()`); each scan/fix logs one JSON line — `{"event":"scan_usage","calls",…,"input_tokens","output_tokens","est_usd","outcome","books","ms"}` — searchable in Vercel logs.
+- **Cost logging:** `callJson()` adds each call's token usage to a per-request tally (`AsyncLocalStorage`, via `withUsage()`); each scan/fix logs one JSON line — `{"event":"scan_usage","calls",…,"input_tokens","output_tokens","est_usd","outcome","books","ms","by_pass","by_model"}` — searchable in Vercel logs. `est_usd` is priced per model (`priceFor()`); `by_pass` (keyed by schema name) shows where the tokens go.
+- **Cheap where it's safe:** the photo passes use `MODEL_VISION` (gpt-4o); text-only steps use `MODEL_TEXT` (gpt-4o mini). The verify passes return only changes, not the whole list, because output tokens cost 4× input.
 - **Owner-side hard cap:** set a monthly budget limit on the OpenAI project.
 
 ### ISBN barcode scanning
